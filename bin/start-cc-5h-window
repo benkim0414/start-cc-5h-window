@@ -3,6 +3,11 @@ set -eu
 
 APP_NAME=start-cc-5h-window
 
+config_dir() { printf '%s/.config/%s\n' "$HOME" "$APP_NAME"; }
+config_file() { printf '%s/config.env\n' "$(config_dir)"; }
+log_dir() { printf '%s/Library/Logs/%s\n' "$HOME" "$APP_NAME"; }
+launch_agent_file() { printf '%s/Library/LaunchAgents/com.local.%s.plist\n' "$HOME" "$APP_NAME"; }
+
 usage() {
   cat <<'USAGE'
 start-cc-5h-window install [--dry-run] [--overwrite-pmset]
@@ -14,10 +19,94 @@ start-cc-5h-window help
 USAGE
 }
 
+set_defaults() {
+  [ "${START_CC_5H_WINDOW_TIME+x}" ] || START_CC_5H_WINDOW_TIME=07:00
+  [ "${START_CC_5H_WINDOW_TIMEZONE+x}" ] || START_CC_5H_WINDOW_TIMEZONE=Australia/Melbourne
+  [ "${START_CC_5H_WINDOW_PROMPT+x}" ] || START_CC_5H_WINDOW_PROMPT='Reply with: ok'
+  [ "${START_CC_5H_WINDOW_CLAUDE_BIN+x}" ] || START_CC_5H_WINDOW_CLAUDE_BIN=claude
+}
+
+invalid_config_line() {
+  file=$1
+  line_no=$2
+  printf '%s: invalid config line %s:%s\n' "$APP_NAME" "$file" "$line_no" >&2
+  return 1
+}
+
+load_config() {
+  set_defaults
+  file=$(config_file)
+  [ -f "$file" ] || return 0
+
+  line_no=0
+  while IFS= read -r line || [ -n "$line" ]; do
+    line_no=$((line_no + 1))
+    case "$line" in
+      ''|\#*) continue ;;
+    esac
+    case "$line" in
+      *=*) ;;
+      *) invalid_config_line "$file" "$line_no" ;;
+    esac
+
+    key=${line%%=*}
+    value=${line#*=}
+    case "$key" in
+      START_CC_5H_WINDOW_TIME) START_CC_5H_WINDOW_TIME=$value ;;
+      START_CC_5H_WINDOW_TIMEZONE) START_CC_5H_WINDOW_TIMEZONE=$value ;;
+      START_CC_5H_WINDOW_PROMPT) START_CC_5H_WINDOW_PROMPT=$value ;;
+      START_CC_5H_WINDOW_CLAUDE_BIN) START_CC_5H_WINDOW_CLAUDE_BIN=$value ;;
+      *) invalid_config_line "$file" "$line_no" ;;
+    esac
+  done <"$file"
+
+  set_defaults
+}
+
+validate_time() {
+  case "$1" in
+    [01][0-9]:[0-5][0-9]|2[0-3]:[0-5][0-9]) ;;
+    *) return 1 ;;
+  esac
+}
+
+validate_config_value() {
+  name=$1
+  value=$2
+  [ -n "$value" ] || {
+    printf '%s: missing %s\n' "$APP_NAME" "$name" >&2
+    return 1
+  }
+}
+
+validate_config() {
+  validate_time "$START_CC_5H_WINDOW_TIME" || {
+    printf '%s: invalid START_CC_5H_WINDOW_TIME: %s\n' "$APP_NAME" "$START_CC_5H_WINDOW_TIME" >&2
+    return 1
+  }
+  validate_config_value START_CC_5H_WINDOW_TIMEZONE "$START_CC_5H_WINDOW_TIMEZONE"
+  validate_config_value START_CC_5H_WINDOW_PROMPT "$START_CC_5H_WINDOW_PROMPT"
+  validate_config_value START_CC_5H_WINDOW_CLAUDE_BIN "$START_CC_5H_WINDOW_CLAUDE_BIN"
+}
+
+status() {
+  load_config
+  validate_config
+  printf 'START_CC_5H_WINDOW_TIME=%s\n' "$START_CC_5H_WINDOW_TIME"
+  printf 'START_CC_5H_WINDOW_TIMEZONE=%s\n' "$START_CC_5H_WINDOW_TIMEZONE"
+  printf 'START_CC_5H_WINDOW_PROMPT=%s\n' "$START_CC_5H_WINDOW_PROMPT"
+  printf 'START_CC_5H_WINDOW_CLAUDE_BIN=%s\n' "$START_CC_5H_WINDOW_CLAUDE_BIN"
+  printf 'CONFIG_DIR=%s\n' "$(config_dir)"
+  printf 'CONFIG_FILE=%s\n' "$(config_file)"
+  printf 'LOG_DIR=%s\n' "$(log_dir)"
+  printf 'LAUNCH_AGENT_FILE=%s\n' "$(launch_agent_file)"
+}
+
 main() {
   command=${1:-help}
   case "$command" in
     help|-h|--help) usage ;;
+    status) status ;;
     *) printf '%s: unknown command: %s\n' "$APP_NAME" "$command" >&2; usage >&2; exit 2 ;;
   esac
 }
