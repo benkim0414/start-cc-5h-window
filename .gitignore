@@ -1,0 +1,14 @@
+.DS_Store
+
+# Local config and logs
+.env
+*.log
+
+# Build outputs
+bin/
+dist/
+
+# Editor and tool caches
+.vscode/
+.idea/
+.cache/
