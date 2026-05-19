@@ -1,0 +1,25 @@
+#!/bin/sh
+set -eu
+
+APP_NAME=start-cc-5h-window
+
+usage() {
+  cat <<'USAGE'
+start-cc-5h-window install [--dry-run] [--overwrite-pmset]
+start-cc-5h-window uninstall [--dry-run]
+start-cc-5h-window status
+start-cc-5h-window run
+start-cc-5h-window configure
+start-cc-5h-window help
+USAGE
+}
+
+main() {
+  command=${1:-help}
+  case "$command" in
+    help|-h|--help) usage ;;
+    *) printf '%s: unknown command: %s\n' "$APP_NAME" "$command" >&2; usage >&2; exit 2 ;;
+  esac
+}
+
+main "$@"
