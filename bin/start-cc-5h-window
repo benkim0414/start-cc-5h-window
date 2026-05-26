@@ -7,6 +7,24 @@ config_dir() { printf '%s/.config/%s\n' "$HOME" "$APP_NAME"; }
 config_file() { printf '%s/config.env\n' "$(config_dir)"; }
 log_dir() { printf '%s/Library/Logs/%s\n' "$HOME" "$APP_NAME"; }
 launch_agent_file() { printf '%s/Library/LaunchAgents/com.local.%s.plist\n' "$HOME" "$APP_NAME"; }
+stdout_log() { printf '%s/stdout.log\n' "$(log_dir)"; }
+stderr_log() { printf '%s/stderr.log\n' "$(log_dir)"; }
+
+raw_script_path() {
+  case "$0" in
+    */*) printf '%s\n' "$0" ;;
+    *)
+      command -v "$0" || {
+        printf '%s: cannot resolve executable path for %s\n' "$APP_NAME" "$0" >&2
+        return 1
+      }
+      ;;
+  esac
+}
+
+script_dir() { CDPATH= cd "$(dirname "$(raw_script_path)")" && pwd; }
+script_path() { printf '%s/%s\n' "$(script_dir)" "$(basename "$(raw_script_path)")"; }
+template_file() { printf '%s/share/com.local.%s.plist.template\n' "$(CDPATH= cd "$(script_dir)/.." && pwd)" "$APP_NAME"; }
 
 usage() {
   cat <<'USAGE'
@@ -89,6 +107,109 @@ validate_config() {
   validate_config_value START_CC_5H_WINDOW_CLAUDE_BIN "$START_CC_5H_WINDOW_CLAUDE_BIN"
 }
 
+decimal_number() {
+  value=$1
+  value=${value#0}
+  [ -n "$value" ] || value=0
+  printf '%s\n' "$value"
+}
+
+time_hour() { decimal_number "${START_CC_5H_WINDOW_TIME%:*}"; }
+time_minute() { decimal_number "${START_CC_5H_WINDOW_TIME#*:}"; }
+
+wake_time() {
+  hour=$(time_hour)
+  minute=$(time_minute)
+  total=$((hour * 60 + minute - 5))
+  [ "$total" -ge 0 ] || total=$((total + 1440))
+  printf '%02d:%02d\n' "$((total / 60))" "$((total % 60))"
+}
+
+sed_replacement() {
+  printf '%s' "$1" | sed 's/[\/&|]/\\&/g'
+}
+
+xml_escape() {
+  printf '%s' "$1" | sed \
+    -e 's/&/\&amp;/g' \
+    -e 's/</\&lt;/g' \
+    -e 's/>/\&gt;/g'
+}
+
+xml_sed_replacement() {
+  sed_replacement "$(xml_escape "$1")"
+}
+
+render_plist() {
+  template=$(template_file)
+  [ -f "$template" ] || {
+    printf '%s: missing plist template: %s\n' "$APP_NAME" "$template" >&2
+    return 1
+  }
+
+  app_path=$(xml_sed_replacement "$(script_path)")
+  hour=$(time_hour)
+  minute=$(time_minute)
+  out_log=$(xml_sed_replacement "$(stdout_log)")
+  err_log=$(xml_sed_replacement "$(stderr_log)")
+
+  sed \
+    -e "s|__APP_PATH__|$app_path|g" \
+    -e "s|__HOUR__|$hour|g" \
+    -e "s|__MINUTE__|$minute|g" \
+    -e "s|__STDOUT_LOG__|$out_log|g" \
+    -e "s|__STDERR_LOG__|$err_log|g" \
+    "$template"
+}
+
+print_install_plan() {
+  uid=$(id -u)
+  wake=$(wake_time)
+
+  printf 'CONFIG_DIR=%s\n' "$(config_dir)"
+  printf 'CONFIG_FILE=%s\n' "$(config_file)"
+  printf 'LOG_DIR=%s\n' "$(log_dir)"
+  printf 'LAUNCH_AGENT_FILE=%s\n' "$(launch_agent_file)"
+  printf 'PLIST_TEMPLATE=%s\n' "$(template_file)"
+  printf 'STDOUT_LOG=%s\n' "$(stdout_log)"
+  printf 'STDERR_LOG=%s\n' "$(stderr_log)"
+  printf 'APP_PATH=%s\n' "$(script_path)"
+  printf 'launchctl bootstrap gui/%s %s\n' "$uid" "$(launch_agent_file)"
+  printf 'pmset repeat wakeorpoweron MTWRFSU %s:00\n' "$wake"
+}
+
+install() {
+  dry_run=false
+  overwrite_pmset=false
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --dry-run) dry_run=true ;;
+      --overwrite-pmset) overwrite_pmset=true ;;
+      *) printf '%s: unknown install flag: %s\n' "$APP_NAME" "$1" >&2; return 2 ;;
+    esac
+    shift
+  done
+
+  load_config
+  validate_config
+
+  if [ "$dry_run" = true ]; then
+    print_install_plan
+    printf '%s\n' '--- rendered plist ---'
+    render_plist
+    return 0
+  fi
+
+  printf '%s: install is not implemented yet; use install --dry-run\n' "$APP_NAME" >&2
+  [ "$overwrite_pmset" = false ] || :
+  return 2
+}
+
+not_implemented() {
+  printf '%s: %s is not implemented yet\n' "$APP_NAME" "$1" >&2
+  return 2
+}
+
 status() {
   load_config
   validate_config
@@ -106,7 +227,9 @@ main() {
   command=${1:-help}
   case "$command" in
     help|-h|--help) usage ;;
+    install) shift; install "$@" ;;
     status) status ;;
+    uninstall|run|configure) not_implemented "$command" ;;
     *) printf '%s: unknown command: %s\n' "$APP_NAME" "$command" >&2; usage >&2; exit 2 ;;
   esac
 }

@@ -84,4 +84,63 @@ CONFIG
 assert_fails_contains "shell code fails as malformed config" "invalid config line" "$APP" status
 assert_not_exists "$marker" "config shell code was not executed"
 
+dry_home="$tmpdir/dry-home"
+HOME="$dry_home"
+export HOME
+stubs="$tmpdir/stubs"
+calls="$tmpdir/calls"
+mkdir -p "$stubs"
+cat >"$stubs/launchctl" <<'STUB'
+#!/bin/sh
+mkdir -p "$(dirname "$LAUNCHCTL_CALLS")"
+printf '%s\n' "$*" >>"$LAUNCHCTL_CALLS"
+STUB
+cat >"$stubs/pmset" <<'STUB'
+#!/bin/sh
+mkdir -p "$(dirname "$PMSET_CALLS")"
+printf '%s\n' "$*" >>"$PMSET_CALLS"
+STUB
+chmod +x "$stubs/launchctl" "$stubs/pmset"
+LAUNCHCTL_CALLS="$calls/launchctl"
+PMSET_CALLS="$calls/pmset"
+PATH="$stubs:$PATH"
+export LAUNCHCTL_CALLS PMSET_CALLS PATH
+
+output=$("$APP" install --dry-run)
+assert_contains "$output" "CONFIG_FILE=$HOME/.config/start-cc-5h-window/config.env" "dry-run prints config file path"
+assert_contains "$output" "launchctl bootstrap gui/" "dry-run prints launchctl bootstrap command"
+assert_contains "$output" "pmset repeat wakeorpoweron" "dry-run prints pmset wake command"
+assert_contains "$output" "<key>Hour</key>" "dry-run prints plist hour key"
+assert_contains "$output" "<integer>7</integer>" "dry-run prints default hour"
+assert_contains "$output" "<key>Minute</key>" "dry-run prints plist minute key"
+assert_contains "$output" "<integer>0</integer>" "dry-run prints default minute"
+assert_not_exists "$HOME/.config/start-cc-5h-window" "dry-run did not create config dir"
+assert_not_exists "$HOME/Library/LaunchAgents/com.local.start-cc-5h-window.plist" "dry-run did not create launch agent file"
+assert_not_exists "$HOME/Library/Logs/start-cc-5h-window" "dry-run did not create log dir"
+assert_not_exists "$LAUNCHCTL_CALLS" "dry-run did not call launchctl"
+assert_not_exists "$PMSET_CALLS" "dry-run did not call pmset"
+
+assert_fails_contains "unknown install flag fails" "unknown install flag: --bogus" "$APP" install --bogus
+
+PATH="$ROOT_DIR/bin:$PATH"
+export PATH
+old_pwd=$(pwd)
+cd "$tmpdir"
+output=$(start-cc-5h-window install --dry-run)
+cd "$old_pwd"
+assert_contains "$output" "APP_PATH=$ROOT_DIR/bin/start-cc-5h-window" "PATH invocation resolves app path"
+assert_contains "$output" "<string>$ROOT_DIR/bin/start-cc-5h-window</string>" "PATH invocation renders app path"
+
+xml_home="$tmpdir/home & <xml>"
+HOME="$xml_home"
+mkdir -p "$HOME"
+export HOME
+output=$("$APP" install --dry-run)
+assert_contains "$output" "home &amp; &lt;xml&gt;" "dry-run XML-escapes home path"
+assert_contains "$output" "<string>$ROOT_DIR/bin/start-cc-5h-window</string>" "dry-run still renders app path"
+
+assert_fails_contains "run placeholder is recognized" "run is not implemented yet" "$APP" run
+assert_fails_contains "configure placeholder is recognized" "configure is not implemented yet" "$APP" configure
+assert_fails_contains "uninstall placeholder is recognized" "uninstall is not implemented yet" "$APP" uninstall
+
 printf 'ok - smoke\n'
