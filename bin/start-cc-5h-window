@@ -162,6 +162,49 @@ render_plist() {
     "$template"
 }
 
+write_default_config() {
+  file=$(config_file)
+  [ -f "$file" ] && return 0
+
+  cat >"$file" <<CONFIG
+START_CC_5H_WINDOW_TIME=$START_CC_5H_WINDOW_TIME
+START_CC_5H_WINDOW_TIMEZONE=$START_CC_5H_WINDOW_TIMEZONE
+START_CC_5H_WINDOW_PROMPT=$START_CC_5H_WINDOW_PROMPT
+START_CC_5H_WINDOW_CLAUDE_BIN=$START_CC_5H_WINDOW_CLAUDE_BIN
+CONFIG
+}
+
+pmset_schedule() {
+  pmset -g sched
+}
+
+has_repeat_wake_schedule() {
+  schedule=$1
+  printf '%s\n' "$schedule" | awk '
+    /Repeating power events:/ { in_repeat = 1; next }
+    /Scheduled power events:/ { in_repeat = 0 }
+    in_repeat && /(wake|wakeorpoweron|poweron)/ { found = 1 }
+    END { exit found ? 0 : 1 }
+  '
+}
+
+check_pmset_conflict() {
+  overwrite_pmset=$1
+  schedule=$(pmset_schedule)
+
+  if has_repeat_wake_schedule "$schedule" && [ "$overwrite_pmset" = false ]; then
+    printf '%s: existing repeat wake schedule found; not changing pmset\n' "$APP_NAME" >&2
+    printf '%s\n' "$schedule" >&2
+    printf '%s: rerun install with --overwrite-pmset to replace it\n' "$APP_NAME" >&2
+    return 1
+  fi
+}
+
+apply_pmset_schedule() {
+  wake=$(wake_time)
+  pmset repeat wakeorpoweron MTWRFSU "$wake:00"
+}
+
 print_install_plan() {
   uid=$(id -u)
   wake=$(wake_time)
@@ -200,9 +243,18 @@ install() {
     return 0
   fi
 
-  printf '%s: install is not implemented yet; use install --dry-run\n' "$APP_NAME" >&2
-  [ "$overwrite_pmset" = false ] || :
-  return 2
+  check_pmset_conflict "$overwrite_pmset"
+
+  mkdir -p "$(config_dir)" "$(dirname "$(launch_agent_file)")" "$(log_dir)"
+  write_default_config
+  render_plist >"$(launch_agent_file)"
+
+  uid=$(id -u)
+  plist=$(launch_agent_file)
+  launchctl bootout "gui/$uid" "$plist" >/dev/null 2>&1 || :
+  launchctl bootstrap "gui/$uid" "$plist"
+  launchctl enable "gui/$uid/com.local.$APP_NAME"
+  apply_pmset_schedule
 }
 
 not_implemented() {

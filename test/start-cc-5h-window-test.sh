@@ -22,6 +22,12 @@ assert_not_exists() {
   [ ! -e "$path" ] || fail "$message"
 }
 
+assert_exists() {
+  path=$1
+  message=$2
+  [ -e "$path" ] || fail "$message"
+}
+
 assert_fails_contains() {
   message=$1
   needle=$2
@@ -94,13 +100,26 @@ cat >"$stubs/launchctl" <<'STUB'
 #!/bin/sh
 mkdir -p "$(dirname "$LAUNCHCTL_CALLS")"
 printf '%s\n' "$*" >>"$LAUNCHCTL_CALLS"
+case "$1" in
+  bootout) exit 1 ;;
+esac
 STUB
 cat >"$stubs/pmset" <<'STUB'
 #!/bin/sh
 mkdir -p "$(dirname "$PMSET_CALLS")"
 printf '%s\n' "$*" >>"$PMSET_CALLS"
+if [ "$1" = "-g" ] && [ "$2" = "sched" ]; then
+  [ "${PMSET_SCHED_OUTPUT+x}" ] && printf '%s\n' "$PMSET_SCHED_OUTPUT"
+fi
 STUB
-chmod +x "$stubs/launchctl" "$stubs/pmset"
+cat >"$stubs/id" <<'STUB'
+#!/bin/sh
+case "$1" in
+  -u) printf '%s\n' 501 ;;
+  *) printf 'id stub only supports -u\n' >&2; exit 2 ;;
+esac
+STUB
+chmod +x "$stubs/launchctl" "$stubs/pmset" "$stubs/id"
 LAUNCHCTL_CALLS="$calls/launchctl"
 PMSET_CALLS="$calls/pmset"
 PATH="$stubs:$PATH"
@@ -119,6 +138,80 @@ assert_not_exists "$HOME/Library/LaunchAgents/com.local.start-cc-5h-window.plist
 assert_not_exists "$HOME/Library/Logs/start-cc-5h-window" "dry-run did not create log dir"
 assert_not_exists "$LAUNCHCTL_CALLS" "dry-run did not call launchctl"
 assert_not_exists "$PMSET_CALLS" "dry-run did not call pmset"
+
+install_home="$tmpdir/install-home"
+HOME="$install_home"
+export HOME
+PMSET_SCHED_OUTPUT=
+export PMSET_SCHED_OUTPUT
+rm -f "$LAUNCHCTL_CALLS" "$PMSET_CALLS"
+output=$("$APP" install)
+assert_exists "$HOME/.config/start-cc-5h-window" "install creates config dir"
+assert_exists "$HOME/.config/start-cc-5h-window/config.env" "install creates config file"
+assert_exists "$HOME/Library/LaunchAgents/com.local.start-cc-5h-window.plist" "install creates launch agent plist"
+assert_exists "$HOME/Library/Logs/start-cc-5h-window" "install creates log dir"
+assert_contains "$(cat "$HOME/.config/start-cc-5h-window/config.env")" "START_CC_5H_WINDOW_TIME=07:00" "install writes default time"
+assert_contains "$(cat "$HOME/Library/LaunchAgents/com.local.start-cc-5h-window.plist")" "<integer>7</integer>" "install writes plist hour"
+assert_contains "$(cat "$LAUNCHCTL_CALLS")" "bootout gui/501 $HOME/Library/LaunchAgents/com.local.start-cc-5h-window.plist" "install calls launchctl bootout"
+assert_contains "$(cat "$LAUNCHCTL_CALLS")" "bootstrap gui/501 $HOME/Library/LaunchAgents/com.local.start-cc-5h-window.plist" "install calls launchctl bootstrap"
+assert_contains "$(cat "$LAUNCHCTL_CALLS")" "enable gui/501/com.local.start-cc-5h-window" "install calls launchctl enable"
+assert_contains "$(cat "$PMSET_CALLS")" "-g sched" "install checks pmset schedule"
+assert_contains "$(cat "$PMSET_CALLS")" "repeat wakeorpoweron MTWRFSU 06:55:00" "install sets pmset repeat when no conflict"
+
+existing_config_home="$tmpdir/existing-config-home"
+HOME="$existing_config_home"
+export HOME
+mkdir -p "$HOME/.config/start-cc-5h-window"
+cat >"$HOME/.config/start-cc-5h-window/config.env" <<'CONFIG'
+START_CC_5H_WINDOW_TIME=08:15
+START_CC_5H_WINDOW_PROMPT=Existing prompt
+CONFIG
+rm -f "$LAUNCHCTL_CALLS" "$PMSET_CALLS"
+"$APP" install >/dev/null
+assert_contains "$(cat "$HOME/.config/start-cc-5h-window/config.env")" "START_CC_5H_WINDOW_PROMPT=Existing prompt" "install preserves existing config"
+
+conflict_home="$tmpdir/conflict-home"
+HOME="$conflict_home"
+export HOME
+PMSET_SCHED_OUTPUT='Repeating power events:
+  wakeorpoweron at 06:45 every day'
+export PMSET_SCHED_OUTPUT
+rm -f "$LAUNCHCTL_CALLS" "$PMSET_CALLS"
+output=$("$APP" install 2>&1) && fail "install fails on existing pmset repeat wake schedule"
+assert_contains "$output" "existing repeat wake schedule" "install warns about existing pmset repeat wake schedule"
+assert_contains "$output" "wakeorpoweron at 06:45 every day" "install prints existing pmset schedule"
+assert_contains "$(cat "$PMSET_CALLS")" "-g sched" "install checks conflicting pmset schedule"
+assert_not_exists "$HOME/.config/start-cc-5h-window" "pmset conflict does not create config dir"
+assert_not_exists "$HOME/Library/LaunchAgents/com.local.start-cc-5h-window.plist" "pmset conflict does not create plist"
+assert_not_exists "$LAUNCHCTL_CALLS" "pmset conflict does not call launchctl"
+pmset_calls=$(cat "$PMSET_CALLS")
+case "$pmset_calls" in
+  *"repeat wakeorpoweron"*) fail "install did not overwrite conflicting pmset schedule" ;;
+esac
+
+poweron_conflict_home="$tmpdir/poweron-conflict-home"
+HOME="$poweron_conflict_home"
+export HOME
+PMSET_SCHED_OUTPUT='Repeating power events:
+  poweron at 06:45 every day'
+export PMSET_SCHED_OUTPUT
+rm -f "$LAUNCHCTL_CALLS" "$PMSET_CALLS"
+output=$("$APP" install 2>&1) && fail "install fails on existing pmset repeat poweron schedule"
+assert_contains "$output" "existing repeat wake schedule" "install treats repeat poweron as conflict"
+assert_not_exists "$LAUNCHCTL_CALLS" "repeat poweron conflict does not call launchctl"
+pmset_calls=$(cat "$PMSET_CALLS")
+case "$pmset_calls" in
+  *"repeat wakeorpoweron"*) fail "install did not overwrite conflicting poweron schedule" ;;
+esac
+
+HOME="$conflict_home"
+export HOME
+PMSET_SCHED_OUTPUT='Repeating power events:
+  wakeorpoweron at 06:45 every day'
+export PMSET_SCHED_OUTPUT
+rm -f "$PMSET_CALLS"
+output=$("$APP" install --overwrite-pmset 2>&1)
+assert_contains "$(cat "$PMSET_CALLS")" "repeat wakeorpoweron MTWRFSU 06:55:00" "overwrite install updates pmset repeat"
 
 assert_fails_contains "unknown install flag fails" "unknown install flag: --bogus" "$APP" install --bogus
 
