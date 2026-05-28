@@ -166,6 +166,11 @@ write_default_config() {
   file=$(config_file)
   [ -f "$file" ] && return 0
 
+  write_config_file "$file"
+}
+
+write_config_file() {
+  file=$1
   cat >"$file" <<CONFIG
 START_CC_5H_WINDOW_TIME=$START_CC_5H_WINDOW_TIME
 START_CC_5H_WINDOW_TIMEZONE=$START_CC_5H_WINDOW_TIMEZONE
@@ -188,6 +193,18 @@ has_repeat_wake_schedule() {
   '
 }
 
+repeat_wake_schedule_summary() {
+  schedule=$1
+  printf '%s\n' "$schedule" | awk '
+    /Repeating power events:/ { in_repeat = 1; next }
+    /Scheduled power events:/ { in_repeat = 0 }
+    in_repeat && /(wake|wakeorpoweron|poweron)/ {
+      sub(/^[[:space:]]*/, "")
+      print
+    }
+  '
+}
+
 check_pmset_conflict() {
   overwrite_pmset=$1
   schedule=$(pmset_schedule)
@@ -203,6 +220,33 @@ check_pmset_conflict() {
 apply_pmset_schedule() {
   wake=$(wake_time)
   pmset repeat wakeorpoweron MTWRFSU "$wake:00"
+}
+
+matching_pmset_schedule() {
+  schedule=$1
+  wake=$(wake_time)
+  repeat_wake_schedule_summary "$schedule" | awk -v wake="$wake" '
+    index($0, "wakeorpoweron") > 0 && index($0, wake) > 0 && index($0, "MTWRFSU") > 0 { found = 1 }
+    END { exit found ? 0 : 1 }
+  '
+}
+
+clear_pmset_schedule_if_matching() {
+  schedule=$(pmset_schedule 2>/dev/null) || {
+    printf '%s: unable to inspect pmset schedule; leaving it unchanged\n' "$APP_NAME" >&2
+    return 0
+  }
+  [ -n "$schedule" ] || return 0
+  has_repeat_wake_schedule "$schedule" || return 0
+
+  if matching_pmset_schedule "$schedule"; then
+    pmset repeat cancel
+    return 0
+  fi
+
+  printf '%s: pmset repeat wake schedule does not match %s; leaving it unchanged\n' \
+    "$APP_NAME" "$(wake_time)" >&2
+  printf '%s\n' "$schedule" >&2
 }
 
 print_install_plan() {
@@ -348,6 +392,85 @@ not_implemented() {
   return 2
 }
 
+apply_config_env_overrides() {
+  [ "$CONFIG_ENV_TIME_SET" = true ] && START_CC_5H_WINDOW_TIME=$CONFIG_ENV_TIME
+  [ "$CONFIG_ENV_TIMEZONE_SET" = true ] && START_CC_5H_WINDOW_TIMEZONE=$CONFIG_ENV_TIMEZONE
+  [ "$CONFIG_ENV_PROMPT_SET" = true ] && START_CC_5H_WINDOW_PROMPT=$CONFIG_ENV_PROMPT
+  [ "$CONFIG_ENV_CLAUDE_BIN_SET" = true ] && START_CC_5H_WINDOW_CLAUDE_BIN=$CONFIG_ENV_CLAUDE_BIN
+  return 0
+}
+
+configure() {
+  CONFIG_ENV_TIME_SET=false
+  CONFIG_ENV_TIMEZONE_SET=false
+  CONFIG_ENV_PROMPT_SET=false
+  CONFIG_ENV_CLAUDE_BIN_SET=false
+
+  if [ "${START_CC_5H_WINDOW_TIME+x}" ]; then
+    CONFIG_ENV_TIME_SET=true
+    CONFIG_ENV_TIME=$START_CC_5H_WINDOW_TIME
+  fi
+  if [ "${START_CC_5H_WINDOW_TIMEZONE+x}" ]; then
+    CONFIG_ENV_TIMEZONE_SET=true
+    CONFIG_ENV_TIMEZONE=$START_CC_5H_WINDOW_TIMEZONE
+  fi
+  if [ "${START_CC_5H_WINDOW_PROMPT+x}" ]; then
+    CONFIG_ENV_PROMPT_SET=true
+    CONFIG_ENV_PROMPT=$START_CC_5H_WINDOW_PROMPT
+  fi
+  if [ "${START_CC_5H_WINDOW_CLAUDE_BIN+x}" ]; then
+    CONFIG_ENV_CLAUDE_BIN_SET=true
+    CONFIG_ENV_CLAUDE_BIN=$START_CC_5H_WINDOW_CLAUDE_BIN
+  fi
+
+  load_config
+  apply_config_env_overrides
+  validate_config
+
+  mkdir -p "$(config_dir)"
+  write_config_file "$(config_file)"
+  printf 'CONFIG_FILE=%s\n' "$(config_file)"
+}
+
+launch_agent_state() {
+  uid=$(id -u)
+  label=com.local.$APP_NAME
+
+  if ! command -v launchctl >/dev/null 2>&1; then
+    printf 'unavailable\n'
+    return 0
+  fi
+
+  if launchctl print "gui/$uid/$label" >/dev/null 2>&1; then
+    printf 'loaded\n'
+  else
+    printf 'not loaded\n'
+  fi
+}
+
+print_pmset_summary() {
+  if ! command -v pmset >/dev/null 2>&1; then
+    printf 'PMSET_SCHEDULE=unavailable\n'
+    return 0
+  fi
+
+  schedule=$(pmset_schedule 2>/dev/null) || schedule=
+  summary=$(repeat_wake_schedule_summary "$schedule")
+  if [ -n "$summary" ]; then
+    printf 'PMSET_SCHEDULE=%s\n' "$summary"
+  else
+    printf 'PMSET_SCHEDULE=none\n'
+  fi
+}
+
+print_latest_log() {
+  set -- "$(log_dir)"/run-*.log
+  [ -e "$1" ] || return 0
+
+  latest=$(for log_file do printf '%s\n' "$log_file"; done | sort | tail -n 1)
+  printf 'LATEST_LOG=%s\n' "$latest"
+}
+
 status() {
   load_config
   validate_config
@@ -359,6 +482,49 @@ status() {
   printf 'CONFIG_FILE=%s\n' "$(config_file)"
   printf 'LOG_DIR=%s\n' "$(log_dir)"
   printf 'LAUNCH_AGENT_FILE=%s\n' "$(launch_agent_file)"
+  printf 'LAUNCH_AGENT_LOADED=%s\n' "$(launch_agent_state)"
+  print_pmset_summary
+  print_latest_log
+}
+
+print_uninstall_plan() {
+  uid=$(id -u)
+  plist=$(launch_agent_file)
+  printf 'launchctl bootout gui/%s %s\n' "$uid" "$plist"
+  printf 'rm %s\n' "$plist"
+  schedule=$(pmset_schedule 2>/dev/null) || schedule=
+  if [ -n "$schedule" ] && has_repeat_wake_schedule "$schedule"; then
+    if matching_pmset_schedule "$schedule"; then
+      printf 'pmset repeat cancel\n'
+    else
+      printf 'pmset repeat unchanged\n'
+    fi
+  fi
+}
+
+uninstall() {
+  dry_run=false
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --dry-run) dry_run=true ;;
+      *) printf '%s: unknown uninstall flag: %s\n' "$APP_NAME" "$1" >&2; return 2 ;;
+    esac
+    shift
+  done
+
+  load_config
+  validate_config
+
+  if [ "$dry_run" = true ]; then
+    print_uninstall_plan
+    return 0
+  fi
+
+  uid=$(id -u)
+  plist=$(launch_agent_file)
+  launchctl bootout "gui/$uid" "$plist" >/dev/null 2>&1 || :
+  rm -f "$plist"
+  clear_pmset_schedule_if_matching
 }
 
 main() {
@@ -368,7 +534,8 @@ main() {
     install) shift; install "$@" ;;
     status) status ;;
     run) run ;;
-    uninstall|configure) not_implemented "$command" ;;
+    configure) configure ;;
+    uninstall) shift; uninstall "$@" ;;
     *) printf '%s: unknown command: %s\n' "$APP_NAME" "$command" >&2; usage >&2; exit 2 ;;
   esac
 }

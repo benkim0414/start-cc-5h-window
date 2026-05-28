@@ -101,6 +101,12 @@ cat >"$stubs/launchctl" <<'STUB'
 mkdir -p "$(dirname "$LAUNCHCTL_CALLS")"
 printf '%s\n' "$*" >>"$LAUNCHCTL_CALLS"
 case "$1" in
+  print)
+    case "${LAUNCHCTL_PRINT_MODE:-loaded}" in
+      loaded) printf 'state = running\n' ;;
+      missing) exit 113 ;;
+    esac
+    ;;
   bootout) exit 1 ;;
 esac
 STUB
@@ -109,6 +115,7 @@ cat >"$stubs/pmset" <<'STUB'
 mkdir -p "$(dirname "$PMSET_CALLS")"
 printf '%s\n' "$*" >>"$PMSET_CALLS"
 if [ "$1" = "-g" ] && [ "$2" = "sched" ]; then
+  [ "${PMSET_FAIL_SCHED:-false}" = true ] && exit 1
   [ "${PMSET_SCHED_OUTPUT+x}" ] && printf '%s\n' "$PMSET_SCHED_OUTPUT"
 fi
 STUB
@@ -348,7 +355,138 @@ assert_not_exists "$HOME/Library/Logs/start-cc-5h-window"/*.stdout "run removes 
 assert_not_exists "$HOME/Library/Logs/start-cc-5h-window"/*.stderr "run removes stderr temp file"
 unset SYSTEMSETUP_MODE
 
-assert_fails_contains "configure placeholder is recognized" "configure is not implemented yet" "$APP" configure
-assert_fails_contains "uninstall placeholder is recognized" "uninstall is not implemented yet" "$APP" uninstall
+status_home="$tmpdir/status-home"
+HOME="$status_home"
+mkdir -p "$HOME/Library/Logs/start-cc-5h-window"
+export HOME
+cat >"$HOME/Library/Logs/start-cc-5h-window/run-20260101070000-1.log" <<'LOG'
+old
+LOG
+cat >"$HOME/Library/Logs/start-cc-5h-window/run-20260101080000-2.log" <<'LOG'
+new
+LOG
+PMSET_SCHED_OUTPUT='Repeating power events:
+  wakeorpoweron MTWRFSU 06:55:00'
+LAUNCHCTL_PRINT_MODE=loaded
+export PMSET_SCHED_OUTPUT LAUNCHCTL_PRINT_MODE
+rm -f "$LAUNCHCTL_CALLS" "$PMSET_CALLS"
+output=$("$APP" status)
+assert_contains "$output" "CONFIG_FILE=$HOME/.config/start-cc-5h-window/config.env" "status shows config file path"
+assert_contains "$output" "LAUNCH_AGENT_FILE=$HOME/Library/LaunchAgents/com.local.start-cc-5h-window.plist" "status shows plist path"
+assert_contains "$output" "LOG_DIR=$HOME/Library/Logs/start-cc-5h-window" "status shows log dir"
+assert_contains "$output" "LAUNCH_AGENT_LOADED=loaded" "status shows loaded launch agent"
+assert_contains "$output" "PMSET_SCHEDULE=wakeorpoweron MTWRFSU 06:55:00" "status summarizes pmset schedule"
+assert_contains "$output" "LATEST_LOG=$HOME/Library/Logs/start-cc-5h-window/run-20260101080000-2.log" "status shows newest run log"
+assert_contains "$(cat "$LAUNCHCTL_CALLS")" "print gui/501/com.local.start-cc-5h-window" "status checks launch agent state"
+assert_contains "$(cat "$PMSET_CALLS")" "-g sched" "status checks pmset schedule"
+
+LAUNCHCTL_PRINT_MODE=missing
+export LAUNCHCTL_PRINT_MODE
+rm -f "$LAUNCHCTL_CALLS"
+output=$("$APP" status)
+assert_contains "$output" "LAUNCH_AGENT_LOADED=not loaded" "status shows missing launch agent"
+
+configure_home="$tmpdir/configure-home"
+HOME="$configure_home"
+mkdir -p "$HOME/.config/start-cc-5h-window"
+export HOME
+cat >"$HOME/.config/start-cc-5h-window/config.env" <<'CONFIG'
+START_CC_5H_WINDOW_TIME=08:15
+START_CC_5H_WINDOW_PROMPT=Existing prompt
+CONFIG
+START_CC_5H_WINDOW_TIME=10:45
+START_CC_5H_WINDOW_TIMEZONE=Etc/UTC
+START_CC_5H_WINDOW_CLAUDE_BIN=/opt/claude
+export START_CC_5H_WINDOW_TIME START_CC_5H_WINDOW_TIMEZONE START_CC_5H_WINDOW_CLAUDE_BIN
+"$APP" configure >/dev/null
+configured=$(cat "$HOME/.config/start-cc-5h-window/config.env")
+assert_contains "$configured" "START_CC_5H_WINDOW_TIME=10:45" "configure applies time override"
+assert_contains "$configured" "START_CC_5H_WINDOW_TIMEZONE=Etc/UTC" "configure applies timezone override"
+assert_contains "$configured" "START_CC_5H_WINDOW_PROMPT=Existing prompt" "configure preserves prompt"
+assert_contains "$configured" "START_CC_5H_WINDOW_CLAUDE_BIN=/opt/claude" "configure applies claude bin override"
+unset START_CC_5H_WINDOW_TIME START_CC_5H_WINDOW_TIMEZONE START_CC_5H_WINDOW_CLAUDE_BIN
+
+new_configure_home="$tmpdir/new-configure-home"
+HOME="$new_configure_home"
+export HOME
+"$APP" configure >/dev/null
+assert_exists "$HOME/.config/start-cc-5h-window/config.env" "configure creates config file"
+assert_contains "$(cat "$HOME/.config/start-cc-5h-window/config.env")" "START_CC_5H_WINDOW_TIME=07:00" "configure writes complete defaults"
+
+invalid_configure_home="$tmpdir/invalid-configure-home"
+HOME="$invalid_configure_home"
+export HOME
+START_CC_5H_WINDOW_TIME=25:00
+export START_CC_5H_WINDOW_TIME
+assert_fails_contains "configure validates resulting config" "invalid START_CC_5H_WINDOW_TIME: 25:00" "$APP" configure
+unset START_CC_5H_WINDOW_TIME
+
+uninstall_home="$tmpdir/uninstall-home"
+HOME="$uninstall_home"
+mkdir -p "$HOME/Library/LaunchAgents"
+printf 'plist\n' >"$HOME/Library/LaunchAgents/com.local.start-cc-5h-window.plist"
+export HOME
+PMSET_SCHED_OUTPUT='Repeating power events:
+  wakeorpoweron MTWRFSU 06:55:00'
+export PMSET_SCHED_OUTPUT
+rm -f "$LAUNCHCTL_CALLS" "$PMSET_CALLS"
+output=$("$APP" uninstall --dry-run)
+assert_contains "$output" "launchctl bootout gui/501 $HOME/Library/LaunchAgents/com.local.start-cc-5h-window.plist" "uninstall dry-run prints bootout"
+assert_contains "$output" "rm $HOME/Library/LaunchAgents/com.local.start-cc-5h-window.plist" "uninstall dry-run prints plist removal"
+assert_contains "$output" "pmset repeat cancel" "uninstall dry-run prints matching pmset cancellation"
+assert_not_exists "$LAUNCHCTL_CALLS" "uninstall dry-run does not call launchctl"
+assert_exists "$HOME/Library/LaunchAgents/com.local.start-cc-5h-window.plist" "uninstall dry-run keeps plist"
+
+rm -f "$LAUNCHCTL_CALLS" "$PMSET_CALLS"
+"$APP" uninstall >/dev/null
+assert_contains "$(cat "$LAUNCHCTL_CALLS")" "bootout gui/501 $HOME/Library/LaunchAgents/com.local.start-cc-5h-window.plist" "uninstall calls launchctl bootout"
+assert_contains "$(cat "$PMSET_CALLS")" "-g sched" "uninstall inspects pmset schedule"
+assert_contains "$(cat "$PMSET_CALLS")" "repeat cancel" "uninstall clears matching pmset schedule"
+assert_not_exists "$HOME/Library/LaunchAgents/com.local.start-cc-5h-window.plist" "uninstall removes plist"
+
+unrelated_uninstall_home="$tmpdir/unrelated-uninstall-home"
+HOME="$unrelated_uninstall_home"
+mkdir -p "$HOME/Library/LaunchAgents"
+printf 'plist\n' >"$HOME/Library/LaunchAgents/com.local.start-cc-5h-window.plist"
+export HOME
+PMSET_SCHED_OUTPUT='Repeating power events:
+  wakeorpoweron MTWRFSU 06:45:00'
+export PMSET_SCHED_OUTPUT
+rm -f "$LAUNCHCTL_CALLS" "$PMSET_CALLS"
+output=$("$APP" uninstall 2>&1)
+assert_contains "$output" "pmset repeat wake schedule does not match 06:55" "uninstall warns about unrelated pmset schedule"
+pmset_calls=$(cat "$PMSET_CALLS")
+case "$pmset_calls" in
+  *"repeat cancel"*) fail "uninstall does not remove unrelated pmset schedule" ;;
+esac
+
+same_time_unrelated_uninstall_home="$tmpdir/same-time-unrelated-uninstall-home"
+HOME="$same_time_unrelated_uninstall_home"
+mkdir -p "$HOME/Library/LaunchAgents"
+printf 'plist\n' >"$HOME/Library/LaunchAgents/com.local.start-cc-5h-window.plist"
+export HOME
+PMSET_SCHED_OUTPUT='Repeating power events:
+  wake at 06:55 every day'
+export PMSET_SCHED_OUTPUT
+rm -f "$LAUNCHCTL_CALLS" "$PMSET_CALLS"
+output=$("$APP" uninstall 2>&1)
+assert_contains "$output" "pmset repeat wake schedule does not match 06:55" "uninstall warns about same-time unrelated pmset schedule"
+pmset_calls=$(cat "$PMSET_CALLS")
+case "$pmset_calls" in
+  *"repeat cancel"*) fail "uninstall does not remove same-time unrelated pmset schedule" ;;
+esac
+
+pmset_fail_uninstall_home="$tmpdir/pmset-fail-uninstall-home"
+HOME="$pmset_fail_uninstall_home"
+mkdir -p "$HOME/Library/LaunchAgents"
+printf 'plist\n' >"$HOME/Library/LaunchAgents/com.local.start-cc-5h-window.plist"
+export HOME
+PMSET_FAIL_SCHED=true
+export PMSET_FAIL_SCHED
+rm -f "$LAUNCHCTL_CALLS" "$PMSET_CALLS"
+output=$("$APP" uninstall 2>&1)
+assert_contains "$output" "unable to inspect pmset schedule" "uninstall warns when pmset inspection fails"
+assert_not_exists "$HOME/Library/LaunchAgents/com.local.start-cc-5h-window.plist" "uninstall still removes plist when pmset inspection fails"
+unset PMSET_FAIL_SCHED
 
 printf 'ok - smoke\n'
