@@ -232,7 +232,122 @@ output=$("$APP" install --dry-run)
 assert_contains "$output" "home &amp; &lt;xml&gt;" "dry-run XML-escapes home path"
 assert_contains "$output" "<string>$ROOT_DIR/bin/start-cc-5h-window</string>" "dry-run still renders app path"
 
-assert_fails_contains "run placeholder is recognized" "run is not implemented yet" "$APP" run
+run_home="$tmpdir/run-home"
+HOME="$run_home"
+mkdir -p "$HOME"
+export HOME
+claude_args="$tmpdir/claude-args"
+cat >"$stubs/claude" <<STUB
+#!/bin/sh
+: >"$claude_args"
+for arg do
+  printf '<%s>\n' "\$arg" >>"$claude_args"
+done
+printf 'ok\n'
+STUB
+cat >"$stubs/systemsetup" <<'STUB'
+#!/bin/sh
+case "${SYSTEMSETUP_MODE:-success}" in
+  success)
+    if [ "$1" = "-gettimezone" ]; then
+      printf 'Time Zone: Etc/UTC\n'
+      exit 0
+    fi
+    ;;
+  fail)
+    printf 'You need administrator access to run this tool... exiting!\n' >&2
+    exit 1
+    ;;
+esac
+exit 2
+STUB
+cat >"$stubs/date" <<'STUB'
+#!/bin/sh
+case "$1" in
+  +%Z) printf 'AEDT\n' ;;
+  *) /bin/date "$@" ;;
+esac
+STUB
+chmod +x "$stubs/claude" "$stubs/systemsetup" "$stubs/date"
+PATH="$stubs:$PATH"
+export PATH
+
+output=$("$APP" run)
+assert_contains "$output" "ok" "run prints claude stdout"
+expected_args=$(printf '<--bare>\n<-p>\n<Reply with: ok>')
+[ "$(cat "$claude_args")" = "$expected_args" ] || fail "run invokes claude with bare prompt"
+log_dir="$HOME/Library/Logs/start-cc-5h-window"
+set -- "$log_dir"/run-*.log
+[ "$#" -eq 1 ] || fail "run created exactly one log file"
+assert_exists "$1" "run created log file"
+log_content=$(cat "$1")
+assert_contains "$log_content" "configured_time=07:00" "run log includes configured time"
+assert_contains "$log_content" "configured_timezone=Australia/Melbourne" "run log includes configured timezone"
+assert_contains "$log_content" "command_path=claude" "run log includes command path"
+assert_contains "$log_content" "stdout:" "run log includes stdout section"
+assert_contains "$log_content" "ok" "run log includes claude stdout"
+assert_contains "$log_content" "stderr:" "run log includes stderr section"
+assert_contains "$log_content" "timezone_warning=" "run log includes timezone warning"
+assert_contains "$log_content" "exit_code=0" "run log includes success exit code"
+assert_contains "$log_content" "status=success" "run log includes success status"
+
+failure_home="$tmpdir/run-failure-home"
+HOME="$failure_home"
+mkdir -p "$HOME"
+export HOME
+failing_claude="$tmpdir/failing-claude"
+cat >"$failing_claude" <<'STUB'
+#!/bin/sh
+printf 'nope\n' >&2
+exit 7
+STUB
+chmod +x "$failing_claude"
+START_CC_5H_WINDOW_CLAUDE_BIN="$failing_claude"
+export START_CC_5H_WINDOW_CLAUDE_BIN
+if "$APP" run >/dev/null 2>&1; then
+  fail "run returns nonzero claude exit"
+else
+  run_code=$?
+fi
+[ "$run_code" -eq 7 ] || fail "run returned claude exit code"
+set -- "$HOME/Library/Logs/start-cc-5h-window"/run-*.log
+[ "$#" -eq 1 ] || fail "failed run created exactly one log file"
+failure_log=$(cat "$1")
+assert_contains "$failure_log" "stderr:" "failed run log includes stderr section"
+assert_contains "$failure_log" "nope" "failed run log includes claude stderr"
+assert_contains "$failure_log" "exit_code=7" "failed run log includes failure exit code"
+assert_contains "$failure_log" "status=failure" "failed run log includes failure status"
+unset START_CC_5H_WINDOW_CLAUDE_BIN
+
+fallback_home="$tmpdir/run-fallback-home"
+HOME="$fallback_home"
+mkdir -p "$HOME"
+export HOME
+SYSTEMSETUP_MODE=fail
+export SYSTEMSETUP_MODE
+cat >"$stubs/claude" <<'STUB'
+#!/bin/sh
+printf 'OUT_NO_NL'
+printf 'ERR_NO_NL' >&2
+STUB
+chmod +x "$stubs/claude"
+output=$("$APP" run 2>"$tmpdir/no-newline-stderr")
+assert_contains "$output" "OUT_NO_NL" "run prints stdout without trailing newline"
+assert_contains "$(cat "$tmpdir/no-newline-stderr")" "ERR_NO_NL" "run prints stderr without trailing newline"
+set -- "$HOME/Library/Logs/start-cc-5h-window"/run-*.log
+[ "$#" -eq 1 ] || fail "fallback run created exactly one log file"
+fallback_log=$(cat "$1")
+assert_contains "$fallback_log" "current_timezone=AEDT" "run falls back when systemsetup fails"
+case "$fallback_log" in
+  *"OUT_NO_NLstderr:"*) fail "run log separates stdout from stderr" ;;
+esac
+case "$fallback_log" in
+  *"ERR_NO_NLexit_code=0"*) fail "run log separates stderr from exit code" ;;
+esac
+assert_not_exists "$HOME/Library/Logs/start-cc-5h-window"/*.stdout "run removes stdout temp file"
+assert_not_exists "$HOME/Library/Logs/start-cc-5h-window"/*.stderr "run removes stderr temp file"
+unset SYSTEMSETUP_MODE
+
 assert_fails_contains "configure placeholder is recognized" "configure is not implemented yet" "$APP" configure
 assert_fails_contains "uninstall placeholder is recognized" "uninstall is not implemented yet" "$APP" uninstall
 

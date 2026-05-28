@@ -257,6 +257,92 @@ install() {
   apply_pmset_schedule
 }
 
+current_timezone() {
+  if command -v systemsetup >/dev/null 2>&1; then
+    timezone_output=$(systemsetup -gettimezone 2>/dev/null) || timezone_output=
+    timezone=$(printf '%s\n' "$timezone_output" | sed -n 's/^Time Zone: //p')
+    if [ -n "$timezone" ]; then
+      printf '%s\n' "$timezone"
+      return 0
+    fi
+  fi
+
+  date +%Z
+}
+
+warn_timezone_mismatch() {
+  actual_timezone=$1
+  log_file=$2
+
+  if [ -n "$actual_timezone" ] && [ "$actual_timezone" != "$START_CC_5H_WINDOW_TIMEZONE" ]; then
+    printf 'timezone_warning=configured timezone %s does not match current timezone %s\n' \
+      "$START_CC_5H_WINDOW_TIMEZONE" "$actual_timezone" >>"$log_file"
+    return 0
+  fi
+
+  printf 'timezone_warning=none\n' >>"$log_file"
+}
+
+run_claude_ping() {
+  stdout_file=$1
+  stderr_file=$2
+
+  set +e
+  "$START_CC_5H_WINDOW_CLAUDE_BIN" --bare -p "$START_CC_5H_WINDOW_PROMPT" >"$stdout_file" 2>"$stderr_file"
+  exit_code=$?
+  set -e
+
+  return "$exit_code"
+}
+
+run() {
+  load_config
+  validate_config
+
+  mkdir -p "$(log_dir)"
+  timestamp=$(date '+%Y%m%d-%H%M%S')
+  log_file=$(log_dir)/run-$timestamp-$$.log
+  stdout_file=$(log_dir)/run-$timestamp-$$.stdout
+  stderr_file=$(log_dir)/run-$timestamp-$$.stderr
+  trap 'rm -f "$stdout_file" "$stderr_file"' EXIT HUP INT TERM
+  actual_timezone=$(current_timezone)
+
+  {
+    printf 'start_timestamp=%s\n' "$(date '+%Y-%m-%dT%H:%M:%S%z')"
+    printf 'configured_time=%s\n' "$START_CC_5H_WINDOW_TIME"
+    printf 'configured_timezone=%s\n' "$START_CC_5H_WINDOW_TIMEZONE"
+    printf 'current_timezone=%s\n' "$actual_timezone"
+    printf 'command_path=%s\n' "$START_CC_5H_WINDOW_CLAUDE_BIN"
+  } >"$log_file"
+  warn_timezone_mismatch "$actual_timezone" "$log_file"
+
+  if run_claude_ping "$stdout_file" "$stderr_file"; then
+    exit_code=0
+    status=success
+  else
+    exit_code=$?
+    status=failure
+  fi
+
+  {
+    printf 'stdout:\n'
+    cat "$stdout_file"
+    printf '\n'
+    printf 'stderr:\n'
+    cat "$stderr_file"
+    printf '\n'
+    printf 'exit_code=%s\n' "$exit_code"
+    printf 'status=%s\n' "$status"
+  } >>"$log_file"
+
+  cat "$stdout_file"
+  cat "$stderr_file" >&2
+  rm -f "$stdout_file" "$stderr_file"
+  trap - EXIT HUP INT TERM
+
+  return "$exit_code"
+}
+
 not_implemented() {
   printf '%s: %s is not implemented yet\n' "$APP_NAME" "$1" >&2
   return 2
@@ -281,7 +367,8 @@ main() {
     help|-h|--help) usage ;;
     install) shift; install "$@" ;;
     status) status ;;
-    uninstall|run|configure) not_implemented "$command" ;;
+    run) run ;;
+    uninstall|configure) not_implemented "$command" ;;
     *) printf '%s: unknown command: %s\n' "$APP_NAME" "$command" >&2; usage >&2; exit 2 ;;
   esac
 }
