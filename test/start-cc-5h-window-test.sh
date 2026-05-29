@@ -107,6 +107,10 @@ case "$1" in
       missing) exit 113 ;;
     esac
     ;;
+  bootstrap)
+    [ "${LAUNCHCTL_FAIL_BOOTSTRAP:-false}" = true ] && exit 77
+    exit 0
+    ;;
   bootout) exit 1 ;;
 esac
 STUB
@@ -117,7 +121,10 @@ printf '%s\n' "$*" >>"$PMSET_CALLS"
 if [ "$1" = "-g" ] && [ "$2" = "sched" ]; then
   [ "${PMSET_FAIL_SCHED:-false}" = true ] && exit 1
   [ "${PMSET_SCHED_OUTPUT+x}" ] && printf '%s\n' "$PMSET_SCHED_OUTPUT"
+  exit 0
 fi
+[ "${PMSET_FAIL_REPEAT:-false}" = true ] && [ "$1" = "repeat" ] && exit 64
+exit 0
 STUB
 cat >"$stubs/id" <<'STUB'
 #!/bin/sh
@@ -126,7 +133,11 @@ case "$1" in
   *) printf 'id stub only supports -u\n' >&2; exit 2 ;;
 esac
 STUB
-chmod +x "$stubs/launchctl" "$stubs/pmset" "$stubs/id"
+cat >"$stubs/sudo" <<'STUB'
+#!/bin/sh
+exec "$@"
+STUB
+chmod +x "$stubs/launchctl" "$stubs/pmset" "$stubs/id" "$stubs/sudo"
 LAUNCHCTL_CALLS="$calls/launchctl"
 PMSET_CALLS="$calls/pmset"
 PATH="$stubs:$PATH"
@@ -165,6 +176,42 @@ assert_contains "$(cat "$LAUNCHCTL_CALLS")" "enable gui/501/com.local.start-cc-5
 assert_contains "$(cat "$PMSET_CALLS")" "-g sched" "install checks pmset schedule"
 assert_contains "$(cat "$PMSET_CALLS")" "repeat wakeorpoweron MTWRFSU 06:55:00" "install sets pmset repeat when no conflict"
 
+pmset_fail_install_home="$tmpdir/pmset-fail-install-home"
+HOME="$pmset_fail_install_home"
+export HOME
+PMSET_FAIL_REPEAT=true
+export PMSET_FAIL_REPEAT
+PMSET_SCHED_OUTPUT=
+export PMSET_SCHED_OUTPUT
+rm -f "$LAUNCHCTL_CALLS" "$PMSET_CALLS"
+if "$APP" install >/dev/null 2>&1; then
+  fail "install fails when pmset repeat fails"
+fi
+assert_contains "$(cat "$LAUNCHCTL_CALLS")" "bootstrap gui/501 $HOME/Library/LaunchAgents/com.local.start-cc-5h-window.plist" "install loads launch agent before pmset"
+assert_contains "$(cat "$PMSET_CALLS")" "repeat wakeorpoweron MTWRFSU 06:55:00" "install attempts pmset"
+assert_contains "$(cat "$LAUNCHCTL_CALLS")" "bootout gui/501 $HOME/Library/LaunchAgents/com.local.start-cc-5h-window.plist" "install rolls back launch agent after pmset failure"
+assert_not_exists "$HOME/Library/LaunchAgents/com.local.start-cc-5h-window.plist" "install removes plist after pmset failure"
+unset PMSET_FAIL_REPEAT
+
+launchctl_fail_install_home="$tmpdir/launchctl-fail-install-home"
+HOME="$launchctl_fail_install_home"
+export HOME
+LAUNCHCTL_FAIL_BOOTSTRAP=true
+export LAUNCHCTL_FAIL_BOOTSTRAP
+PMSET_SCHED_OUTPUT=
+export PMSET_SCHED_OUTPUT
+rm -f "$LAUNCHCTL_CALLS" "$PMSET_CALLS"
+if "$APP" install >/dev/null 2>&1; then
+  fail "install fails when launchctl bootstrap fails"
+fi
+assert_contains "$(cat "$LAUNCHCTL_CALLS")" "bootstrap gui/501 $HOME/Library/LaunchAgents/com.local.start-cc-5h-window.plist" "install attempts launchctl bootstrap"
+assert_contains "$(cat "$PMSET_CALLS")" "-g sched" "install checks pmset before launchctl failure"
+pmset_calls=$(cat "$PMSET_CALLS")
+case "$pmset_calls" in
+  *"repeat wakeorpoweron"*) fail "install does not set pmset after launchctl failure" ;;
+esac
+unset LAUNCHCTL_FAIL_BOOTSTRAP
+
 existing_config_home="$tmpdir/existing-config-home"
 HOME="$existing_config_home"
 export HOME
@@ -185,7 +232,7 @@ PMSET_SCHED_OUTPUT='Repeating power events:
 export PMSET_SCHED_OUTPUT
 rm -f "$LAUNCHCTL_CALLS" "$PMSET_CALLS"
 output=$("$APP" install 2>&1) && fail "install fails on existing pmset repeat wake schedule"
-assert_contains "$output" "existing repeat wake schedule" "install warns about existing pmset repeat wake schedule"
+assert_contains "$output" "existing pmset repeat schedule" "install warns about existing pmset repeat schedule"
 assert_contains "$output" "wakeorpoweron at 06:45 every day" "install prints existing pmset schedule"
 assert_contains "$(cat "$PMSET_CALLS")" "-g sched" "install checks conflicting pmset schedule"
 assert_not_exists "$HOME/.config/start-cc-5h-window" "pmset conflict does not create config dir"
@@ -204,11 +251,26 @@ PMSET_SCHED_OUTPUT='Repeating power events:
 export PMSET_SCHED_OUTPUT
 rm -f "$LAUNCHCTL_CALLS" "$PMSET_CALLS"
 output=$("$APP" install 2>&1) && fail "install fails on existing pmset repeat poweron schedule"
-assert_contains "$output" "existing repeat wake schedule" "install treats repeat poweron as conflict"
+assert_contains "$output" "existing pmset repeat schedule" "install treats repeat poweron as conflict"
 assert_not_exists "$LAUNCHCTL_CALLS" "repeat poweron conflict does not call launchctl"
 pmset_calls=$(cat "$PMSET_CALLS")
 case "$pmset_calls" in
   *"repeat wakeorpoweron"*) fail "install did not overwrite conflicting poweron schedule" ;;
+esac
+
+sleep_conflict_home="$tmpdir/sleep-conflict-home"
+HOME="$sleep_conflict_home"
+export HOME
+PMSET_SCHED_OUTPUT='Repeating power events:
+  sleep at 11:00PM every day'
+export PMSET_SCHED_OUTPUT
+rm -f "$LAUNCHCTL_CALLS" "$PMSET_CALLS"
+output=$("$APP" install 2>&1) && fail "install fails on existing pmset repeat sleep schedule"
+assert_contains "$output" "existing pmset repeat schedule" "install treats repeat sleep as conflict"
+assert_not_exists "$LAUNCHCTL_CALLS" "repeat sleep conflict does not call launchctl"
+pmset_calls=$(cat "$PMSET_CALLS")
+case "$pmset_calls" in
+  *"repeat wakeorpoweron"*) fail "install did not overwrite conflicting sleep schedule" ;;
 esac
 
 HOME="$conflict_home"
@@ -421,6 +483,15 @@ export START_CC_5H_WINDOW_TIME
 assert_fails_contains "configure validates resulting config" "invalid START_CC_5H_WINDOW_TIME: 25:00" "$APP" configure
 unset START_CC_5H_WINDOW_TIME
 
+newline_configure_home="$tmpdir/newline-configure-home"
+HOME="$newline_configure_home"
+export HOME
+START_CC_5H_WINDOW_PROMPT='line one
+line two'
+export START_CC_5H_WINDOW_PROMPT
+assert_fails_contains "configure rejects newline prompt" "START_CC_5H_WINDOW_PROMPT must not contain newlines" "$APP" configure
+unset START_CC_5H_WINDOW_PROMPT
+
 uninstall_home="$tmpdir/uninstall-home"
 HOME="$uninstall_home"
 mkdir -p "$HOME/Library/LaunchAgents"
@@ -443,6 +514,52 @@ assert_contains "$(cat "$LAUNCHCTL_CALLS")" "bootout gui/501 $HOME/Library/Launc
 assert_contains "$(cat "$PMSET_CALLS")" "-g sched" "uninstall inspects pmset schedule"
 assert_contains "$(cat "$PMSET_CALLS")" "repeat cancel" "uninstall clears matching pmset schedule"
 assert_not_exists "$HOME/Library/LaunchAgents/com.local.start-cc-5h-window.plist" "uninstall removes plist"
+
+invalid_prompt_uninstall_home="$tmpdir/invalid-prompt-uninstall-home"
+HOME="$invalid_prompt_uninstall_home"
+mkdir -p "$HOME/.config/start-cc-5h-window" "$HOME/Library/LaunchAgents"
+cat >"$HOME/.config/start-cc-5h-window/config.env" <<'CONFIG'
+START_CC_5H_WINDOW_PROMPT=
+CONFIG
+printf 'plist\n' >"$HOME/Library/LaunchAgents/com.local.start-cc-5h-window.plist"
+export HOME
+PMSET_SCHED_OUTPUT='Repeating power events:
+  wakeorpoweron MTWRFSU 06:55:00'
+export PMSET_SCHED_OUTPUT
+rm -f "$LAUNCHCTL_CALLS" "$PMSET_CALLS"
+"$APP" uninstall >/dev/null
+assert_contains "$(cat "$LAUNCHCTL_CALLS")" "bootout gui/501 $HOME/Library/LaunchAgents/com.local.start-cc-5h-window.plist" "uninstall ignores invalid prompt for launchctl cleanup"
+assert_contains "$(cat "$PMSET_CALLS")" "repeat cancel" "uninstall ignores invalid prompt for matching pmset cleanup"
+assert_not_exists "$HOME/Library/LaunchAgents/com.local.start-cc-5h-window.plist" "uninstall removes plist with invalid prompt"
+
+normalized_uninstall_home="$tmpdir/normalized-uninstall-home"
+HOME="$normalized_uninstall_home"
+mkdir -p "$HOME/Library/LaunchAgents"
+printf 'plist\n' >"$HOME/Library/LaunchAgents/com.local.start-cc-5h-window.plist"
+export HOME
+PMSET_SCHED_OUTPUT='Repeating power events:
+  wakepoweron at 6:55AM every day'
+export PMSET_SCHED_OUTPUT
+rm -f "$LAUNCHCTL_CALLS" "$PMSET_CALLS"
+"$APP" uninstall >/dev/null
+assert_contains "$(cat "$PMSET_CALLS")" "repeat cancel" "uninstall clears normalized matching pmset schedule"
+
+combined_uninstall_home="$tmpdir/combined-uninstall-home"
+HOME="$combined_uninstall_home"
+mkdir -p "$HOME/Library/LaunchAgents"
+printf 'plist\n' >"$HOME/Library/LaunchAgents/com.local.start-cc-5h-window.plist"
+export HOME
+PMSET_SCHED_OUTPUT='Repeating power events:
+  wakepoweron at 6:55AM every day
+  sleep at 5:00PM every day'
+export PMSET_SCHED_OUTPUT
+rm -f "$LAUNCHCTL_CALLS" "$PMSET_CALLS"
+output=$("$APP" uninstall 2>&1)
+assert_contains "$output" "pmset repeat wake schedule does not match 06:55" "uninstall warns about combined pmset schedule"
+pmset_calls=$(cat "$PMSET_CALLS")
+case "$pmset_calls" in
+  *"repeat cancel"*) fail "uninstall does not remove combined pmset schedule" ;;
+esac
 
 unrelated_uninstall_home="$tmpdir/unrelated-uninstall-home"
 HOME="$unrelated_uninstall_home"

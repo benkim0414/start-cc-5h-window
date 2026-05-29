@@ -95,6 +95,13 @@ validate_config_value() {
     printf '%s: missing %s\n' "$APP_NAME" "$name" >&2
     return 1
   }
+  case "$value" in
+    *'
+'*)
+      printf '%s: %s must not contain newlines\n' "$APP_NAME" "$name" >&2
+      return 1
+      ;;
+  esac
 }
 
 validate_config() {
@@ -105,6 +112,14 @@ validate_config() {
   validate_config_value START_CC_5H_WINDOW_TIMEZONE "$START_CC_5H_WINDOW_TIMEZONE"
   validate_config_value START_CC_5H_WINDOW_PROMPT "$START_CC_5H_WINDOW_PROMPT"
   validate_config_value START_CC_5H_WINDOW_CLAUDE_BIN "$START_CC_5H_WINDOW_CLAUDE_BIN"
+}
+
+validate_schedule_config() {
+  validate_time "$START_CC_5H_WINDOW_TIME" || {
+    printf '%s: invalid START_CC_5H_WINDOW_TIME: %s\n' "$APP_NAME" "$START_CC_5H_WINDOW_TIME" >&2
+    return 1
+  }
+  validate_config_value START_CC_5H_WINDOW_TIMEZONE "$START_CC_5H_WINDOW_TIMEZONE"
 }
 
 decimal_number() {
@@ -183,14 +198,29 @@ pmset_schedule() {
   pmset -g sched
 }
 
-has_repeat_wake_schedule() {
+pmset_repeat() {
+  if [ "$(id -u)" -eq 0 ]; then
+    pmset repeat "$@"
+  elif command -v sudo >/dev/null 2>&1; then
+    sudo pmset repeat "$@"
+  else
+    pmset repeat "$@"
+  fi
+}
+
+has_repeat_power_schedule() {
   schedule=$1
   printf '%s\n' "$schedule" | awk '
     /Repeating power events:/ { in_repeat = 1; next }
     /Scheduled power events:/ { in_repeat = 0 }
-    in_repeat && /(wake|wakeorpoweron|poweron)/ { found = 1 }
+    in_repeat && NF > 0 { found = 1 }
     END { exit found ? 0 : 1 }
   '
+}
+
+has_repeat_wake_schedule() {
+  schedule=$1
+  repeat_wake_schedule_summary "$schedule" | awk 'NF > 0 { found = 1 } END { exit found ? 0 : 1 }'
 }
 
 repeat_wake_schedule_summary() {
@@ -205,29 +235,89 @@ repeat_wake_schedule_summary() {
   '
 }
 
+repeat_power_schedule_summary() {
+  schedule=$1
+  printf '%s\n' "$schedule" | awk '
+    /Repeating power events:/ { in_repeat = 1; next }
+    /Scheduled power events:/ { in_repeat = 0 }
+    in_repeat && NF > 0 {
+      sub(/^[[:space:]]*/, "")
+      print
+    }
+  '
+}
+
 check_pmset_conflict() {
   overwrite_pmset=$1
   schedule=$(pmset_schedule)
 
-  if has_repeat_wake_schedule "$schedule" && [ "$overwrite_pmset" = false ]; then
-    printf '%s: existing repeat wake schedule found; not changing pmset\n' "$APP_NAME" >&2
+  if has_repeat_power_schedule "$schedule" && [ "$overwrite_pmset" = false ]; then
+    printf '%s: existing pmset repeat schedule found; not changing pmset\n' "$APP_NAME" >&2
     printf '%s\n' "$schedule" >&2
     printf '%s: rerun install with --overwrite-pmset to replace it\n' "$APP_NAME" >&2
     return 1
   fi
+
+  return 0
 }
 
 apply_pmset_schedule() {
   wake=$(wake_time)
-  pmset repeat wakeorpoweron MTWRFSU "$wake:00"
+  pmset_repeat wakeorpoweron MTWRFSU "$wake:00"
+}
+
+install_launch_agent() {
+  uid=$(id -u)
+  plist=$(launch_agent_file)
+  launchctl bootout "gui/$uid" "$plist" >/dev/null 2>&1 || :
+  launchctl bootstrap "gui/$uid" "$plist" || return 1
+  launchctl enable "gui/$uid/com.local.$APP_NAME" || return 1
+}
+
+unload_launch_agent() {
+  uid=$(id -u)
+  plist=$(launch_agent_file)
+  launchctl bootout "gui/$uid" "$plist" >/dev/null 2>&1 || :
 }
 
 matching_pmset_schedule() {
   schedule=$1
   wake=$(wake_time)
-  repeat_wake_schedule_summary "$schedule" | awk -v wake="$wake" '
-    index($0, "wakeorpoweron") > 0 && index($0, wake) > 0 && index($0, "MTWRFSU") > 0 { found = 1 }
-    END { exit found ? 0 : 1 }
+  repeat_power_schedule_summary "$schedule" | awk -v wake="$wake" '
+    function two(n) { return n < 10 ? "0" n : n }
+    function normalized_time(line, parts, count, i, time_text, bits, hour, minute, suffix) {
+      count = split(line, parts, " ")
+      for (i = 1; i < count; i++) {
+        if (parts[i] == "at") {
+          time_text = parts[i + 1]
+          break
+        }
+      }
+      if (time_text != "") {
+        suffix = time_text
+        sub(/^.*[0-9][0-9]:[0-9][0-9](:[0-9][0-9])?/, "", suffix)
+        sub(/(AM|PM|am|pm)$/, "", time_text)
+        split(time_text, bits, ":")
+        hour = bits[1]
+        minute = bits[2]
+        if (suffix == "PM" || suffix == "pm") {
+          if (hour < 12) hour += 12
+        } else if (suffix == "AM" || suffix == "am") {
+          if (hour == 12) hour = 0
+        }
+        return two(hour + 0) ":" minute
+      }
+      return ""
+    }
+
+    { lines += 1; line = $0 }
+    END {
+      if (lines != 1) exit 1
+      if (index(line, "wakeorpoweron") > 0 && index(line, "MTWRFSU") > 0 && index(line, wake ":00") > 0) exit 0
+      normalized = normalized_time(line)
+      if ((index(line, "wakepoweron") > 0 || index(line, "wakeorpoweron") > 0) && index(line, "every day") > 0 && normalized == wake) exit 0
+      exit 1
+    }
   '
 }
 
@@ -240,7 +330,7 @@ clear_pmset_schedule_if_matching() {
   has_repeat_wake_schedule "$schedule" || return 0
 
   if matching_pmset_schedule "$schedule"; then
-    pmset repeat cancel
+    pmset_repeat cancel
     return 0
   fi
 
@@ -293,12 +383,15 @@ install() {
   write_default_config
   render_plist >"$(launch_agent_file)"
 
-  uid=$(id -u)
-  plist=$(launch_agent_file)
-  launchctl bootout "gui/$uid" "$plist" >/dev/null 2>&1 || :
-  launchctl bootstrap "gui/$uid" "$plist"
-  launchctl enable "gui/$uid/com.local.$APP_NAME"
-  apply_pmset_schedule
+  if ! install_launch_agent; then
+    return 1
+  fi
+
+  if ! apply_pmset_schedule; then
+    unload_launch_agent
+    rm -f "$(launch_agent_file)"
+    return 1
+  fi
 }
 
 current_timezone() {
@@ -488,10 +581,15 @@ status() {
 }
 
 print_uninstall_plan() {
+  schedule_config_valid=$1
   uid=$(id -u)
   plist=$(launch_agent_file)
   printf 'launchctl bootout gui/%s %s\n' "$uid" "$plist"
   printf 'rm %s\n' "$plist"
+  if [ "$schedule_config_valid" != true ]; then
+    printf 'pmset repeat unchanged\n'
+    return 0
+  fi
   schedule=$(pmset_schedule 2>/dev/null) || schedule=
   if [ -n "$schedule" ] && has_repeat_wake_schedule "$schedule"; then
     if matching_pmset_schedule "$schedule"; then
@@ -512,11 +610,16 @@ uninstall() {
     shift
   done
 
-  load_config
-  validate_config
+  schedule_config_valid=true
+  if ! load_config; then
+    schedule_config_valid=false
+    set_defaults
+  elif ! validate_schedule_config; then
+    schedule_config_valid=false
+  fi
 
   if [ "$dry_run" = true ]; then
-    print_uninstall_plan
+    print_uninstall_plan "$schedule_config_valid"
     return 0
   fi
 
@@ -524,7 +627,11 @@ uninstall() {
   plist=$(launch_agent_file)
   launchctl bootout "gui/$uid" "$plist" >/dev/null 2>&1 || :
   rm -f "$plist"
-  clear_pmset_schedule_if_matching
+  if [ "$schedule_config_valid" = true ]; then
+    clear_pmset_schedule_if_matching
+  else
+    printf '%s: invalid schedule config; leaving pmset unchanged\n' "$APP_NAME" >&2
+  fi
 }
 
 main() {

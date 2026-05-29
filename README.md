@@ -18,6 +18,8 @@ If the plan looks right, install it:
 bin/start-cc-5h-window install
 ```
 
+The install command creates a user LaunchAgent, then schedules the wake event with `pmset repeat`. On macOS, changing the repeat wake schedule may prompt for administrator credentials through `sudo`; the LaunchAgent itself remains installed for your user.
+
 ## Default Config
 
 The default config is written to `~/.config/start-cc-5h-window/config.env`:
