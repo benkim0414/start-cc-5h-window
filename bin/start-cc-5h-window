@@ -1,5 +1,11 @@
 #!/bin/sh
+# SC1007: `CDPATH= cd ...` resets CDPATH for the command; the space is intentional.
+# SC2094: invalid_config_line writes only to stderr, not the file being read.
+# shellcheck disable=SC1007,SC2094
 set -eu
+# pipefail is intentionally not set: this is POSIX /bin/sh, which has no
+# `set -o pipefail`. The pipelines here end in awk/sed, where the exit status
+# of the final stage is the one that matters for -e.
 
 APP_NAME=start-cc-5h-window
 

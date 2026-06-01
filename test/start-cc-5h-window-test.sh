@@ -1,4 +1,6 @@
 #!/bin/sh
+# SC1007: `CDPATH= cd ...` resets CDPATH for the command; the space is intentional.
+# shellcheck disable=SC1007
 set -eu
 
 ROOT_DIR=$(CDPATH= cd "$(dirname "$0")/.." && pwd)
