@@ -18,7 +18,13 @@ If the plan looks right, install it:
 bin/start-cc-5h-window install
 ```
 
-The install command creates a user LaunchAgent, then schedules the wake event with `pmset repeat`. On macOS, changing the repeat wake schedule may prompt for administrator credentials through `sudo`; the LaunchAgent itself remains installed for your user.
+The install command creates a user LaunchAgent, then schedules the wake event with `pmset repeat`. `pmset repeat` requires root, so install runs it through `sudo` and will prompt for administrator credentials. A non-interactive install (no controlling terminal, or `sudo` configured to require one) cannot answer that prompt: the `pmset` step fails, install rolls back the LaunchAgent, and nothing is left scheduled. Run install from an interactive shell. The LaunchAgent itself does not require root.
+
+## Claude Binary Resolution
+
+`launchd` starts the scheduled job with a minimal `PATH` (`/usr/bin:/bin:/usr/sbin:/sbin`). Because `claude` is usually installed elsewhere (`~/.local/bin`, a Homebrew prefix, or a Node version-manager shim), the bare default `START_CC_5H_WINDOW_CLAUDE_BIN=claude` would not be found at run time. To avoid that, install writes an `EnvironmentVariables`/`PATH` key into the plist that prepends the resolved `claude` directory plus `~/.local/bin`, `/opt/homebrew/bin`, and `/usr/local/bin`.
+
+For maximum reliability set `START_CC_5H_WINDOW_CLAUDE_BIN` to an absolute path. `status` reports `CLAUDE_BIN_RESOLVED=` and warns when the configured binary cannot be resolved, so the scheduled job will not fail silently. Note that a Node version-manager install outside the standard prefixes may still require an absolute path or a custom `PATH`.
 
 ## Default Config
 
@@ -80,3 +86,5 @@ bin/start-cc-5h-window uninstall --dry-run
 ```
 
 `pmset repeat` is system-wide, so the app handles it conservatively. Install refuses to overwrite an existing repeat wake schedule unless you pass `--overwrite-pmset`, and uninstall only cancels the repeat wake schedule when it matches the app's expected schedule.
+
+The schedule match parses the text output of `pmset -g sched`, whose formatting has varied across macOS versions and locales (24-hour vs. 12-hour times, day masks vs. "every day"). The app matches its own written form (`wakeorpoweron MTWRFSU HH:MM:00`) first and falls back to a 12-hour parse. On an unrecognized format the conservative direction holds -- it never cancels a schedule it cannot confirm as its own -- which means on some systems uninstall may leave the app's wake schedule in place. If `status` shows a lingering `PMSET_SCHEDULE` after uninstall, clear it manually with `sudo pmset repeat cancel`.
