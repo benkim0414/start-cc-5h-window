@@ -457,7 +457,20 @@ warn_timezone_mismatch() {
   actual_timezone=$1
   log_file=$2
 
-  if [ -n "$actual_timezone" ] && [ "$actual_timezone" != "$START_CC_5H_WINDOW_TIMEZONE" ]; then
+  # Only IANA-style names (e.g. Australia/Melbourne) are comparable to the
+  # configured timezone. A bare abbreviation (e.g. AEDT, from the `date +%Z`
+  # fallback when systemsetup is unavailable) cannot be matched against an
+  # IANA name, so comparing would produce a spurious mismatch every time.
+  case "$actual_timezone" in
+    */*) ;;
+    *)
+      printf 'timezone_warning=none (current timezone %s not comparable to configured %s)\n' \
+        "$actual_timezone" "$START_CC_5H_WINDOW_TIMEZONE" >>"$log_file"
+      return 0
+      ;;
+  esac
+
+  if [ "$actual_timezone" != "$START_CC_5H_WINDOW_TIMEZONE" ]; then
     printf 'timezone_warning=configured timezone %s does not match current timezone %s\n' \
       "$START_CC_5H_WINDOW_TIMEZONE" "$actual_timezone" >>"$log_file"
     return 0

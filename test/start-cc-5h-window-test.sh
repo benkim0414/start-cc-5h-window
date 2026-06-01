@@ -379,7 +379,7 @@ assert_contains "$log_content" "command_path=claude" "run log includes command p
 assert_contains "$log_content" "stdout:" "run log includes stdout section"
 assert_contains "$log_content" "ok" "run log includes claude stdout"
 assert_contains "$log_content" "stderr:" "run log includes stderr section"
-assert_contains "$log_content" "timezone_warning=" "run log includes timezone warning"
+assert_contains "$log_content" "timezone_warning=configured timezone Australia/Melbourne does not match current timezone Etc/UTC" "run log records IANA timezone mismatch"
 assert_contains "$log_content" "exit_code=0" "run log includes success exit code"
 assert_contains "$log_content" "status=success" "run log includes success status"
 
@@ -430,6 +430,7 @@ set -- "$HOME/Library/Logs/start-cc-5h-window"/run-*.log
 [ "$#" -eq 1 ] || fail "fallback run created exactly one log file"
 fallback_log=$(cat "$1")
 assert_contains "$fallback_log" "current_timezone=AEDT" "run falls back when systemsetup fails"
+assert_contains "$fallback_log" "timezone_warning=none (current timezone AEDT not comparable" "run does not warn on non-comparable abbreviation"
 case "$fallback_log" in
   *"OUT_NO_NLstderr:"*) fail "run log separates stdout from stderr" ;;
 esac
