@@ -65,6 +65,13 @@ START_CC_5H_WINDOW_CLAUDE_BIN=/path/to/claude-stub bin/start-cc-5h-window run
 
 The test suite uses stubs for Claude and system tools; tests do not invoke real Claude.
 
+## Operational Tuning
+
+Two runtime knobs are read from the environment (not persisted in `config.env`):
+
+- `START_CC_5H_WINDOW_TIMEOUT` (default `120`) -- seconds before a hung `claude` ping is killed during `run`. macOS ships no `timeout(1)`, so the ping is bounded by an internal watchdog; this prevents a stuck invocation from holding the scheduled job until the next day. A timed-out ping is logged as `status=failure`.
+- `START_CC_5H_WINDOW_LOG_RETENTION` (default `30`) -- number of most-recent per-run logs to keep under `~/Library/Logs/start-cc-5h-window/`. Older `run-*.log` files are pruned after each run. The launchd-managed `stdout.log`/`stderr.log` append files are not rotated by this tool.
+
 ## Status and Uninstall
 
 Check the current config and launch agent state:
