@@ -12,6 +12,10 @@ RUN_LOG_RETENTION=${START_CC_5H_WINDOW_LOG_RETENTION:-30}
 case "$RUN_LOG_RETENTION" in
   ''|*[!0-9]*) RUN_LOG_RETENTION=30 ;;
 esac
+RUN_TIMEOUT=${START_CC_5H_WINDOW_TIMEOUT:-120}
+case "$RUN_TIMEOUT" in
+  ''|*[!0-9]*) RUN_TIMEOUT=120 ;;
+esac
 
 config_dir() { printf '%s/.config/%s\n' "$HOME" "$APP_NAME"; }
 config_file() { printf '%s/config.env\n' "$(config_dir)"; }
@@ -487,9 +491,23 @@ run_claude_ping() {
   stdout_file=$1
   stderr_file=$2
 
+  # macOS ships no timeout(1), so bound the ping with a background watchdog:
+  # if claude has not exited within RUN_TIMEOUT seconds, kill it so a hung
+  # process does not hold the launchd job slot until the next scheduled fire.
   set +e
-  "$START_CC_5H_WINDOW_CLAUDE_BIN" --bare -p "$START_CC_5H_WINDOW_PROMPT" >"$stdout_file" 2>"$stderr_file"
+  "$START_CC_5H_WINDOW_CLAUDE_BIN" --bare -p "$START_CC_5H_WINDOW_PROMPT" >"$stdout_file" 2>"$stderr_file" &
+  cmd_pid=$!
+  # The watchdog and its sleep child must not inherit this function's stdout,
+  # or an orphaned sleep would hold the pipe open and stall a caller reading
+  # our output via command substitution. Redirect all of its descriptors.
+  ( sleep "$RUN_TIMEOUT"; kill "$cmd_pid" 2>/dev/null ) </dev/null >/dev/null 2>&1 &
+  watchdog_pid=$!
+  wait "$cmd_pid"
   exit_code=$?
+  # Reap the watchdog and its sleep child so no detached sleep lingers.
+  pkill -P "$watchdog_pid" 2>/dev/null
+  kill "$watchdog_pid" 2>/dev/null
+  wait "$watchdog_pid" 2>/dev/null
   set -e
 
   return "$exit_code"

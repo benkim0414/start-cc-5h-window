@@ -457,6 +457,28 @@ assert_not_exists "$rl_dir/run-20200101-000002-2.log" "run removes second-oldest
 assert_exists "$rl_dir/run-20200101-000003-3.log" "run keeps newest pre-existing log within retention"
 unset START_CC_5H_WINDOW_LOG_RETENTION
 
+timeout_home="$tmpdir/timeout-home"
+HOME="$timeout_home"
+mkdir -p "$HOME"
+export HOME
+slow_claude="$tmpdir/slow-claude"
+cat >"$slow_claude" <<'STUB'
+#!/bin/sh
+exec sleep 30
+STUB
+chmod +x "$slow_claude"
+START_CC_5H_WINDOW_CLAUDE_BIN="$slow_claude"
+START_CC_5H_WINDOW_TIMEOUT=1
+export START_CC_5H_WINDOW_CLAUDE_BIN START_CC_5H_WINDOW_TIMEOUT
+if "$APP" run >/dev/null 2>&1; then
+  fail "run times out a hung claude ping"
+fi
+set -- "$HOME/Library/Logs/start-cc-5h-window"/run-*.log
+[ "$#" -eq 1 ] || fail "timed-out run created exactly one log file"
+timeout_log=$(cat "$1")
+assert_contains "$timeout_log" "status=failure" "timed-out run logs failure status"
+unset START_CC_5H_WINDOW_CLAUDE_BIN START_CC_5H_WINDOW_TIMEOUT
+
 status_home="$tmpdir/status-home"
 HOME="$status_home"
 mkdir -p "$HOME/Library/Logs/start-cc-5h-window"
