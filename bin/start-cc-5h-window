@@ -428,6 +428,8 @@ install() {
   render_plist >"$(launch_agent_file)"
 
   if ! install_launch_agent; then
+    unload_launch_agent
+    rm -f "$(launch_agent_file)"
     return 1
   fi
 

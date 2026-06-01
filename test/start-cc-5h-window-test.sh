@@ -212,6 +212,7 @@ if "$APP" install >/dev/null 2>&1; then
   fail "install fails when launchctl bootstrap fails"
 fi
 assert_contains "$(cat "$LAUNCHCTL_CALLS")" "bootstrap gui/501 $HOME/Library/LaunchAgents/com.local.start-cc-5h-window.plist" "install attempts launchctl bootstrap"
+assert_not_exists "$HOME/Library/LaunchAgents/com.local.start-cc-5h-window.plist" "install rolls back plist after launchctl failure"
 assert_contains "$(cat "$PMSET_CALLS")" "-g sched" "install checks pmset before launchctl failure"
 pmset_calls=$(cat "$PMSET_CALLS")
 case "$pmset_calls" in
