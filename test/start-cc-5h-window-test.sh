@@ -441,6 +441,22 @@ assert_not_exists "$HOME/Library/Logs/start-cc-5h-window"/*.stdout "run removes 
 assert_not_exists "$HOME/Library/Logs/start-cc-5h-window"/*.stderr "run removes stderr temp file"
 unset SYSTEMSETUP_MODE
 
+retention_home="$tmpdir/retention-home"
+HOME="$retention_home"
+mkdir -p "$HOME/Library/Logs/start-cc-5h-window"
+export HOME
+rl_dir="$HOME/Library/Logs/start-cc-5h-window"
+for n in 1 2 3; do printf 'old\n' >"$rl_dir/run-20200101-00000$n-$n.log"; done
+START_CC_5H_WINDOW_LOG_RETENTION=2
+export START_CC_5H_WINDOW_LOG_RETENTION
+"$APP" run >/dev/null 2>&1
+set -- "$rl_dir"/run-*.log
+[ "$#" -eq 2 ] || fail "run prunes old logs to retention limit"
+assert_not_exists "$rl_dir/run-20200101-000001-1.log" "run removes oldest log beyond retention"
+assert_not_exists "$rl_dir/run-20200101-000002-2.log" "run removes second-oldest log beyond retention"
+assert_exists "$rl_dir/run-20200101-000003-3.log" "run keeps newest pre-existing log within retention"
+unset START_CC_5H_WINDOW_LOG_RETENTION
+
 status_home="$tmpdir/status-home"
 HOME="$status_home"
 mkdir -p "$HOME/Library/Logs/start-cc-5h-window"

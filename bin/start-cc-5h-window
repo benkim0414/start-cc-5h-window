@@ -8,6 +8,10 @@ set -eu
 # of the final stage is the one that matters for -e.
 
 APP_NAME=start-cc-5h-window
+RUN_LOG_RETENTION=${START_CC_5H_WINDOW_LOG_RETENTION:-30}
+case "$RUN_LOG_RETENTION" in
+  ''|*[!0-9]*) RUN_LOG_RETENTION=30 ;;
+esac
 
 config_dir() { printf '%s/.config/%s\n' "$HOME" "$APP_NAME"; }
 config_file() { printf '%s/config.env\n' "$(config_dir)"; }
@@ -491,6 +495,20 @@ run_claude_ping() {
   return "$exit_code"
 }
 
+prune_run_logs() {
+  set -- "$(log_dir)"/run-*.log
+  [ -e "$1" ] || return 0
+  remove=$(($# - RUN_LOG_RETENTION))
+  [ "$remove" -gt 0 ] || return 0
+  # Glob expands in lexical order; the run-YYYYMMDD-HHMMSS-pid.log naming sorts
+  # chronologically, so the leading entries are the oldest.
+  for log_file do
+    [ "$remove" -gt 0 ] || break
+    rm -f "$log_file"
+    remove=$((remove - 1))
+  done
+}
+
 run() {
   load_config
   validate_config
@@ -535,6 +553,7 @@ run() {
   cat "$stderr_file" >&2
   rm -f "$stdout_file" "$stderr_file"
   trap - EXIT HUP INT TERM
+  prune_run_logs
 
   return "$exit_code"
 }
