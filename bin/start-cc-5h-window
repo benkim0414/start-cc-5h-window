@@ -1,0 +1,749 @@
+#!/bin/sh
+# SC1007: `CDPATH= cd ...` resets CDPATH for the command; the space is intentional.
+# SC2094: invalid_config_line writes only to stderr, not the file being read.
+# shellcheck disable=SC1007,SC2094
+set -eu
+# pipefail is intentionally not set: this is POSIX /bin/sh, which has no
+# `set -o pipefail`. The pipelines here end in awk/sed, where the exit status
+# of the final stage is the one that matters for -e.
+
+APP_NAME=start-cc-5h-window
+RUN_LOG_RETENTION=${START_CC_5H_WINDOW_LOG_RETENTION:-30}
+case "$RUN_LOG_RETENTION" in
+  ''|*[!0-9]*) RUN_LOG_RETENTION=30 ;;
+esac
+RUN_TIMEOUT=${START_CC_5H_WINDOW_TIMEOUT:-120}
+case "$RUN_TIMEOUT" in
+  ''|*[!0-9]*) RUN_TIMEOUT=120 ;;
+esac
+
+config_dir() { printf '%s/.config/%s\n' "$HOME" "$APP_NAME"; }
+config_file() { printf '%s/config.env\n' "$(config_dir)"; }
+log_dir() { printf '%s/Library/Logs/%s\n' "$HOME" "$APP_NAME"; }
+launch_agent_file() { printf '%s/Library/LaunchAgents/com.local.%s.plist\n' "$HOME" "$APP_NAME"; }
+stdout_log() { printf '%s/stdout.log\n' "$(log_dir)"; }
+stderr_log() { printf '%s/stderr.log\n' "$(log_dir)"; }
+
+raw_script_path() {
+  case "$0" in
+    */*) printf '%s\n' "$0" ;;
+    *)
+      command -v "$0" || {
+        printf '%s: cannot resolve executable path for %s\n' "$APP_NAME" "$0" >&2
+        return 1
+      }
+      ;;
+  esac
+}
+
+script_dir() { CDPATH= cd "$(dirname "$(raw_script_path)")" && pwd; }
+script_path() { printf '%s/%s\n' "$(script_dir)" "$(basename "$(raw_script_path)")"; }
+template_file() { printf '%s/share/com.local.%s.plist.template\n' "$(CDPATH= cd "$(script_dir)/.." && pwd)" "$APP_NAME"; }
+
+usage() {
+  cat <<'USAGE'
+start-cc-5h-window install [--dry-run] [--overwrite-pmset]
+start-cc-5h-window uninstall [--dry-run]
+start-cc-5h-window status
+start-cc-5h-window run
+start-cc-5h-window configure
+start-cc-5h-window help
+USAGE
+}
+
+set_defaults() {
+  [ "${START_CC_5H_WINDOW_TIME+x}" ] || START_CC_5H_WINDOW_TIME=07:00
+  [ "${START_CC_5H_WINDOW_TIMEZONE+x}" ] || START_CC_5H_WINDOW_TIMEZONE=Australia/Melbourne
+  [ "${START_CC_5H_WINDOW_PROMPT+x}" ] || START_CC_5H_WINDOW_PROMPT='Reply with: ok'
+  [ "${START_CC_5H_WINDOW_CLAUDE_BIN+x}" ] || START_CC_5H_WINDOW_CLAUDE_BIN=claude
+}
+
+invalid_config_line() {
+  file=$1
+  line_no=$2
+  printf '%s: invalid config line %s:%s\n' "$APP_NAME" "$file" "$line_no" >&2
+  return 1
+}
+
+load_config() {
+  set_defaults
+  file=$(config_file)
+  [ -f "$file" ] || return 0
+
+  line_no=0
+  while IFS= read -r line || [ -n "$line" ]; do
+    line_no=$((line_no + 1))
+    case "$line" in
+      ''|\#*) continue ;;
+    esac
+    case "$line" in
+      *=*) ;;
+      *) invalid_config_line "$file" "$line_no" ;;
+    esac
+
+    key=${line%%=*}
+    value=${line#*=}
+    case "$key" in
+      START_CC_5H_WINDOW_TIME) START_CC_5H_WINDOW_TIME=$value ;;
+      START_CC_5H_WINDOW_TIMEZONE) START_CC_5H_WINDOW_TIMEZONE=$value ;;
+      START_CC_5H_WINDOW_PROMPT) START_CC_5H_WINDOW_PROMPT=$value ;;
+      START_CC_5H_WINDOW_CLAUDE_BIN) START_CC_5H_WINDOW_CLAUDE_BIN=$value ;;
+      *) invalid_config_line "$file" "$line_no" ;;
+    esac
+  done <"$file"
+
+  set_defaults
+}
+
+validate_time() {
+  case "$1" in
+    [01][0-9]:[0-5][0-9]|2[0-3]:[0-5][0-9]) ;;
+    *) return 1 ;;
+  esac
+}
+
+validate_config_value() {
+  name=$1
+  value=$2
+  [ -n "$value" ] || {
+    printf '%s: missing %s\n' "$APP_NAME" "$name" >&2
+    return 1
+  }
+  case "$value" in
+    *'
+'*)
+      printf '%s: %s must not contain newlines\n' "$APP_NAME" "$name" >&2
+      return 1
+      ;;
+  esac
+}
+
+validate_config() {
+  validate_time "$START_CC_5H_WINDOW_TIME" || {
+    printf '%s: invalid START_CC_5H_WINDOW_TIME: %s\n' "$APP_NAME" "$START_CC_5H_WINDOW_TIME" >&2
+    return 1
+  }
+  validate_config_value START_CC_5H_WINDOW_TIMEZONE "$START_CC_5H_WINDOW_TIMEZONE"
+  validate_config_value START_CC_5H_WINDOW_PROMPT "$START_CC_5H_WINDOW_PROMPT"
+  validate_config_value START_CC_5H_WINDOW_CLAUDE_BIN "$START_CC_5H_WINDOW_CLAUDE_BIN"
+}
+
+validate_schedule_config() {
+  validate_time "$START_CC_5H_WINDOW_TIME" || {
+    printf '%s: invalid START_CC_5H_WINDOW_TIME: %s\n' "$APP_NAME" "$START_CC_5H_WINDOW_TIME" >&2
+    return 1
+  }
+  validate_config_value START_CC_5H_WINDOW_TIMEZONE "$START_CC_5H_WINDOW_TIMEZONE"
+}
+
+decimal_number() {
+  value=$1
+  value=${value#0}
+  [ -n "$value" ] || value=0
+  printf '%s\n' "$value"
+}
+
+time_hour() { decimal_number "${START_CC_5H_WINDOW_TIME%:*}"; }
+time_minute() { decimal_number "${START_CC_5H_WINDOW_TIME#*:}"; }
+
+wake_time() {
+  hour=$(time_hour)
+  minute=$(time_minute)
+  total=$((hour * 60 + minute - 5))
+  [ "$total" -ge 0 ] || total=$((total + 1440))
+  printf '%02d:%02d\n' "$((total / 60))" "$((total % 60))"
+}
+
+sed_replacement() {
+  printf '%s' "$1" | sed 's/[\/&|]/\\&/g'
+}
+
+xml_escape() {
+  printf '%s' "$1" | sed \
+    -e 's/&/\&amp;/g' \
+    -e 's/</\&lt;/g' \
+    -e 's/>/\&gt;/g'
+}
+
+xml_sed_replacement() {
+  sed_replacement "$(xml_escape "$1")"
+}
+
+resolve_claude_bin() {
+  bin=$START_CC_5H_WINDOW_CLAUDE_BIN
+  case "$bin" in
+    /*)
+      [ -x "$bin" ] || return 1
+      printf '%s\n' "$bin"
+      ;;
+    */*)
+      dir=$(CDPATH= cd "$(dirname "$bin")" 2>/dev/null && pwd) || return 1
+      resolved=$dir/$(basename "$bin")
+      [ -x "$resolved" ] || return 1
+      printf '%s\n' "$resolved"
+      ;;
+    *) command -v "$bin" 2>/dev/null || return 1 ;;
+  esac
+}
+
+# PATH written into the launchd plist. launchd starts LaunchAgents with a
+# minimal PATH (/usr/bin:/bin:/usr/sbin:/sbin), so a bare "claude" — or claude's
+# own node runtime — would not be found and the scheduled job would fail with
+# exit 127. We prepend the resolved claude directory (when resolvable) and the
+# common user/Homebrew install locations so the job finds the binary unattended.
+launchd_path_env() {
+  base="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+  if resolved=$(resolve_claude_bin); then
+    dir=$(dirname "$resolved")
+    case ":$base:" in
+      *":$dir:"*) printf '%s\n' "$base" ;;
+      *) printf '%s:%s\n' "$dir" "$base" ;;
+    esac
+  else
+    printf '%s\n' "$base"
+  fi
+}
+
+render_plist() {
+  template=$(template_file)
+  [ -f "$template" ] || {
+    printf '%s: missing plist template: %s\n' "$APP_NAME" "$template" >&2
+    return 1
+  }
+
+  app_path=$(xml_sed_replacement "$(script_path)")
+  hour=$(time_hour)
+  minute=$(time_minute)
+  out_log=$(xml_sed_replacement "$(stdout_log)")
+  err_log=$(xml_sed_replacement "$(stderr_log)")
+  path_env=$(xml_sed_replacement "$(launchd_path_env)")
+
+  sed \
+    -e "s|__APP_PATH__|$app_path|g" \
+    -e "s|__HOUR__|$hour|g" \
+    -e "s|__MINUTE__|$minute|g" \
+    -e "s|__STDOUT_LOG__|$out_log|g" \
+    -e "s|__STDERR_LOG__|$err_log|g" \
+    -e "s|__PATH__|$path_env|g" \
+    "$template"
+}
+
+write_default_config() {
+  file=$(config_file)
+  [ -f "$file" ] && return 0
+
+  write_config_file "$file"
+}
+
+write_config_file() {
+  file=$1
+  cat >"$file" <<CONFIG
+START_CC_5H_WINDOW_TIME=$START_CC_5H_WINDOW_TIME
+START_CC_5H_WINDOW_TIMEZONE=$START_CC_5H_WINDOW_TIMEZONE
+START_CC_5H_WINDOW_PROMPT=$START_CC_5H_WINDOW_PROMPT
+START_CC_5H_WINDOW_CLAUDE_BIN=$START_CC_5H_WINDOW_CLAUDE_BIN
+CONFIG
+}
+
+pmset_schedule() {
+  pmset -g sched
+}
+
+pmset_repeat() {
+  if [ "$(id -u)" -eq 0 ]; then
+    pmset repeat "$@"
+  elif command -v sudo >/dev/null 2>&1; then
+    sudo pmset repeat "$@"
+  else
+    pmset repeat "$@"
+  fi
+}
+
+has_repeat_power_schedule() {
+  schedule=$1
+  printf '%s\n' "$schedule" | awk '
+    /Repeating power events:/ { in_repeat = 1; next }
+    /Scheduled power events:/ { in_repeat = 0 }
+    in_repeat && NF > 0 { found = 1 }
+    END { exit found ? 0 : 1 }
+  '
+}
+
+has_repeat_wake_schedule() {
+  schedule=$1
+  repeat_wake_schedule_summary "$schedule" | awk 'NF > 0 { found = 1 } END { exit found ? 0 : 1 }'
+}
+
+repeat_wake_schedule_summary() {
+  schedule=$1
+  printf '%s\n' "$schedule" | awk '
+    /Repeating power events:/ { in_repeat = 1; next }
+    /Scheduled power events:/ { in_repeat = 0 }
+    in_repeat && /(wake|wakeorpoweron|poweron)/ {
+      sub(/^[[:space:]]*/, "")
+      print
+    }
+  '
+}
+
+repeat_power_schedule_summary() {
+  schedule=$1
+  printf '%s\n' "$schedule" | awk '
+    /Repeating power events:/ { in_repeat = 1; next }
+    /Scheduled power events:/ { in_repeat = 0 }
+    in_repeat && NF > 0 {
+      sub(/^[[:space:]]*/, "")
+      print
+    }
+  '
+}
+
+check_pmset_conflict() {
+  overwrite_pmset=$1
+  schedule=$(pmset_schedule)
+
+  if has_repeat_power_schedule "$schedule" && [ "$overwrite_pmset" = false ]; then
+    printf '%s: existing pmset repeat schedule found; not changing pmset\n' "$APP_NAME" >&2
+    printf '%s\n' "$schedule" >&2
+    printf '%s: rerun install with --overwrite-pmset to replace it\n' "$APP_NAME" >&2
+    return 1
+  fi
+
+  return 0
+}
+
+apply_pmset_schedule() {
+  wake=$(wake_time)
+  pmset_repeat wakeorpoweron MTWRFSU "$wake:00"
+}
+
+install_launch_agent() {
+  uid=$(id -u)
+  plist=$(launch_agent_file)
+  launchctl bootout "gui/$uid" "$plist" >/dev/null 2>&1 || :
+  launchctl bootstrap "gui/$uid" "$plist" || return 1
+  launchctl enable "gui/$uid/com.local.$APP_NAME" || return 1
+}
+
+unload_launch_agent() {
+  uid=$(id -u)
+  plist=$(launch_agent_file)
+  launchctl bootout "gui/$uid" "$plist" >/dev/null 2>&1 || :
+}
+
+matching_pmset_schedule() {
+  schedule=$1
+  wake=$(wake_time)
+  repeat_power_schedule_summary "$schedule" | awk -v wake="$wake" '
+    function two(n) { return n < 10 ? "0" n : n }
+    function normalized_time(line, parts, count, i, time_text, bits, hour, minute, suffix) {
+      count = split(line, parts, " ")
+      for (i = 1; i < count; i++) {
+        if (parts[i] == "at") {
+          time_text = parts[i + 1]
+          break
+        }
+      }
+      if (time_text != "") {
+        suffix = time_text
+        sub(/^.*[0-9][0-9]:[0-9][0-9](:[0-9][0-9])?/, "", suffix)
+        sub(/(AM|PM|am|pm)$/, "", time_text)
+        split(time_text, bits, ":")
+        hour = bits[1]
+        minute = bits[2]
+        if (suffix == "PM" || suffix == "pm") {
+          if (hour < 12) hour += 12
+        } else if (suffix == "AM" || suffix == "am") {
+          if (hour == 12) hour = 0
+        }
+        return two(hour + 0) ":" minute
+      }
+      return ""
+    }
+
+    { lines += 1; line = $0 }
+    END {
+      if (lines != 1) exit 1
+      if (index(line, "wakeorpoweron") > 0 && index(line, "MTWRFSU") > 0 && index(line, wake ":00") > 0) exit 0
+      normalized = normalized_time(line)
+      if ((index(line, "wakepoweron") > 0 || index(line, "wakeorpoweron") > 0) && index(line, "every day") > 0 && normalized == wake) exit 0
+      exit 1
+    }
+  '
+}
+
+clear_pmset_schedule_if_matching() {
+  schedule=$(pmset_schedule 2>/dev/null) || {
+    printf '%s: unable to inspect pmset schedule; leaving it unchanged\n' "$APP_NAME" >&2
+    return 0
+  }
+  [ -n "$schedule" ] || return 0
+  has_repeat_wake_schedule "$schedule" || return 0
+
+  if matching_pmset_schedule "$schedule"; then
+    pmset_repeat cancel
+    return 0
+  fi
+
+  printf '%s: pmset repeat wake schedule does not match %s; leaving it unchanged\n' \
+    "$APP_NAME" "$(wake_time)" >&2
+  printf '%s\n' "$schedule" >&2
+}
+
+print_install_plan() {
+  uid=$(id -u)
+  wake=$(wake_time)
+
+  printf 'CONFIG_DIR=%s\n' "$(config_dir)"
+  printf 'CONFIG_FILE=%s\n' "$(config_file)"
+  printf 'LOG_DIR=%s\n' "$(log_dir)"
+  printf 'LAUNCH_AGENT_FILE=%s\n' "$(launch_agent_file)"
+  printf 'PLIST_TEMPLATE=%s\n' "$(template_file)"
+  printf 'STDOUT_LOG=%s\n' "$(stdout_log)"
+  printf 'STDERR_LOG=%s\n' "$(stderr_log)"
+  printf 'APP_PATH=%s\n' "$(script_path)"
+  printf 'PATH_ENV=%s\n' "$(launchd_path_env)"
+  printf 'launchctl bootstrap gui/%s %s\n' "$uid" "$(launch_agent_file)"
+  printf 'pmset repeat wakeorpoweron MTWRFSU %s:00\n' "$wake"
+}
+
+install() {
+  dry_run=false
+  overwrite_pmset=false
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --dry-run) dry_run=true ;;
+      --overwrite-pmset) overwrite_pmset=true ;;
+      *) printf '%s: unknown install flag: %s\n' "$APP_NAME" "$1" >&2; return 2 ;;
+    esac
+    shift
+  done
+
+  load_config
+  validate_config
+
+  if [ "$dry_run" = true ]; then
+    print_install_plan
+    printf '%s\n' '--- rendered plist ---'
+    render_plist
+    return 0
+  fi
+
+  check_pmset_conflict "$overwrite_pmset"
+
+  mkdir -p "$(config_dir)" "$(dirname "$(launch_agent_file)")" "$(log_dir)"
+  write_default_config
+  render_plist >"$(launch_agent_file)"
+
+  if ! install_launch_agent; then
+    unload_launch_agent
+    rm -f "$(launch_agent_file)"
+    return 1
+  fi
+
+  if ! apply_pmset_schedule; then
+    unload_launch_agent
+    rm -f "$(launch_agent_file)"
+    return 1
+  fi
+}
+
+current_timezone() {
+  if command -v systemsetup >/dev/null 2>&1; then
+    timezone_output=$(systemsetup -gettimezone 2>/dev/null) || timezone_output=
+    timezone=$(printf '%s\n' "$timezone_output" | sed -n 's/^Time Zone: //p')
+    if [ -n "$timezone" ]; then
+      printf '%s\n' "$timezone"
+      return 0
+    fi
+  fi
+
+  date +%Z
+}
+
+warn_timezone_mismatch() {
+  actual_timezone=$1
+  log_file=$2
+
+  # Only IANA-style names (e.g. Australia/Melbourne) are comparable to the
+  # configured timezone. A bare abbreviation (e.g. AEDT, from the `date +%Z`
+  # fallback when systemsetup is unavailable) cannot be matched against an
+  # IANA name, so comparing would produce a spurious mismatch every time.
+  case "$actual_timezone" in
+    */*) ;;
+    *)
+      printf 'timezone_warning=none (current timezone %s not comparable to configured %s)\n' \
+        "$actual_timezone" "$START_CC_5H_WINDOW_TIMEZONE" >>"$log_file"
+      return 0
+      ;;
+  esac
+
+  if [ "$actual_timezone" != "$START_CC_5H_WINDOW_TIMEZONE" ]; then
+    printf 'timezone_warning=configured timezone %s does not match current timezone %s\n' \
+      "$START_CC_5H_WINDOW_TIMEZONE" "$actual_timezone" >>"$log_file"
+    return 0
+  fi
+
+  printf 'timezone_warning=none\n' >>"$log_file"
+}
+
+run_claude_ping() {
+  stdout_file=$1
+  stderr_file=$2
+
+  # macOS ships no timeout(1), so bound the ping with a background watchdog:
+  # if claude has not exited within RUN_TIMEOUT seconds, kill it so a hung
+  # process does not hold the launchd job slot until the next scheduled fire.
+  set +e
+  "$START_CC_5H_WINDOW_CLAUDE_BIN" --bare -p "$START_CC_5H_WINDOW_PROMPT" >"$stdout_file" 2>"$stderr_file" &
+  cmd_pid=$!
+  # The watchdog and its sleep child must not inherit this function's stdout,
+  # or an orphaned sleep would hold the pipe open and stall a caller reading
+  # our output via command substitution. Redirect all of its descriptors.
+  ( sleep "$RUN_TIMEOUT"; kill "$cmd_pid" 2>/dev/null ) </dev/null >/dev/null 2>&1 &
+  watchdog_pid=$!
+  wait "$cmd_pid"
+  exit_code=$?
+  # Reap the watchdog and its sleep child so no detached sleep lingers.
+  pkill -P "$watchdog_pid" 2>/dev/null
+  kill "$watchdog_pid" 2>/dev/null
+  wait "$watchdog_pid" 2>/dev/null
+  set -e
+
+  return "$exit_code"
+}
+
+prune_run_logs() {
+  set -- "$(log_dir)"/run-*.log
+  [ -e "$1" ] || return 0
+  remove=$(($# - RUN_LOG_RETENTION))
+  [ "$remove" -gt 0 ] || return 0
+  # Glob expands in lexical order; the run-YYYYMMDD-HHMMSS-pid.log naming sorts
+  # chronologically, so the leading entries are the oldest.
+  for log_file do
+    [ "$remove" -gt 0 ] || break
+    rm -f "$log_file"
+    remove=$((remove - 1))
+  done
+}
+
+run() {
+  load_config
+  validate_config
+
+  mkdir -p "$(log_dir)"
+  timestamp=$(date '+%Y%m%d-%H%M%S')
+  log_file=$(log_dir)/run-$timestamp-$$.log
+  stdout_file=$(log_dir)/run-$timestamp-$$.stdout
+  stderr_file=$(log_dir)/run-$timestamp-$$.stderr
+  trap 'rm -f "$stdout_file" "$stderr_file"' EXIT HUP INT TERM
+  actual_timezone=$(current_timezone)
+
+  {
+    printf 'start_timestamp=%s\n' "$(date '+%Y-%m-%dT%H:%M:%S%z')"
+    printf 'configured_time=%s\n' "$START_CC_5H_WINDOW_TIME"
+    printf 'configured_timezone=%s\n' "$START_CC_5H_WINDOW_TIMEZONE"
+    printf 'current_timezone=%s\n' "$actual_timezone"
+    printf 'command_path=%s\n' "$START_CC_5H_WINDOW_CLAUDE_BIN"
+  } >"$log_file"
+  warn_timezone_mismatch "$actual_timezone" "$log_file"
+
+  if run_claude_ping "$stdout_file" "$stderr_file"; then
+    exit_code=0
+    status=success
+  else
+    exit_code=$?
+    status=failure
+  fi
+
+  {
+    printf 'stdout:\n'
+    cat "$stdout_file"
+    printf '\n'
+    printf 'stderr:\n'
+    cat "$stderr_file"
+    printf '\n'
+    printf 'exit_code=%s\n' "$exit_code"
+    printf 'status=%s\n' "$status"
+  } >>"$log_file"
+
+  cat "$stdout_file"
+  cat "$stderr_file" >&2
+  rm -f "$stdout_file" "$stderr_file"
+  trap - EXIT HUP INT TERM
+  prune_run_logs
+
+  return "$exit_code"
+}
+
+apply_config_env_overrides() {
+  [ "$CONFIG_ENV_TIME_SET" = true ] && START_CC_5H_WINDOW_TIME=$CONFIG_ENV_TIME
+  [ "$CONFIG_ENV_TIMEZONE_SET" = true ] && START_CC_5H_WINDOW_TIMEZONE=$CONFIG_ENV_TIMEZONE
+  [ "$CONFIG_ENV_PROMPT_SET" = true ] && START_CC_5H_WINDOW_PROMPT=$CONFIG_ENV_PROMPT
+  [ "$CONFIG_ENV_CLAUDE_BIN_SET" = true ] && START_CC_5H_WINDOW_CLAUDE_BIN=$CONFIG_ENV_CLAUDE_BIN
+  return 0
+}
+
+configure() {
+  CONFIG_ENV_TIME_SET=false
+  CONFIG_ENV_TIMEZONE_SET=false
+  CONFIG_ENV_PROMPT_SET=false
+  CONFIG_ENV_CLAUDE_BIN_SET=false
+
+  if [ "${START_CC_5H_WINDOW_TIME+x}" ]; then
+    CONFIG_ENV_TIME_SET=true
+    CONFIG_ENV_TIME=$START_CC_5H_WINDOW_TIME
+  fi
+  if [ "${START_CC_5H_WINDOW_TIMEZONE+x}" ]; then
+    CONFIG_ENV_TIMEZONE_SET=true
+    CONFIG_ENV_TIMEZONE=$START_CC_5H_WINDOW_TIMEZONE
+  fi
+  if [ "${START_CC_5H_WINDOW_PROMPT+x}" ]; then
+    CONFIG_ENV_PROMPT_SET=true
+    CONFIG_ENV_PROMPT=$START_CC_5H_WINDOW_PROMPT
+  fi
+  if [ "${START_CC_5H_WINDOW_CLAUDE_BIN+x}" ]; then
+    CONFIG_ENV_CLAUDE_BIN_SET=true
+    CONFIG_ENV_CLAUDE_BIN=$START_CC_5H_WINDOW_CLAUDE_BIN
+  fi
+
+  load_config
+  apply_config_env_overrides
+  validate_config
+
+  mkdir -p "$(config_dir)"
+  write_config_file "$(config_file)"
+  printf 'CONFIG_FILE=%s\n' "$(config_file)"
+}
+
+launch_agent_state() {
+  uid=$(id -u)
+  label=com.local.$APP_NAME
+
+  if ! command -v launchctl >/dev/null 2>&1; then
+    printf 'unavailable\n'
+    return 0
+  fi
+
+  if launchctl print "gui/$uid/$label" >/dev/null 2>&1; then
+    printf 'loaded\n'
+  else
+    printf 'not loaded\n'
+  fi
+}
+
+print_pmset_summary() {
+  if ! command -v pmset >/dev/null 2>&1; then
+    printf 'PMSET_SCHEDULE=unavailable\n'
+    return 0
+  fi
+
+  schedule=$(pmset_schedule 2>/dev/null) || schedule=
+  summary=$(repeat_wake_schedule_summary "$schedule")
+  if [ -n "$summary" ]; then
+    printf 'PMSET_SCHEDULE=%s\n' "$summary"
+  else
+    printf 'PMSET_SCHEDULE=none\n'
+  fi
+}
+
+print_latest_log() {
+  set -- "$(log_dir)"/run-*.log
+  [ -e "$1" ] || return 0
+
+  latest=$(for log_file do printf '%s\n' "$log_file"; done | sort | tail -n 1)
+  printf 'LATEST_LOG=%s\n' "$latest"
+}
+
+status() {
+  load_config
+  validate_config
+  printf 'START_CC_5H_WINDOW_TIME=%s\n' "$START_CC_5H_WINDOW_TIME"
+  printf 'START_CC_5H_WINDOW_TIMEZONE=%s\n' "$START_CC_5H_WINDOW_TIMEZONE"
+  printf 'START_CC_5H_WINDOW_PROMPT=%s\n' "$START_CC_5H_WINDOW_PROMPT"
+  printf 'START_CC_5H_WINDOW_CLAUDE_BIN=%s\n' "$START_CC_5H_WINDOW_CLAUDE_BIN"
+  if resolved=$(resolve_claude_bin); then
+    printf 'CLAUDE_BIN_RESOLVED=%s\n' "$resolved"
+  else
+    printf 'CLAUDE_BIN_RESOLVED=unresolved\n'
+    printf '%s: claude binary %s is not resolvable on PATH; the scheduled job will fail. Set START_CC_5H_WINDOW_CLAUDE_BIN to an absolute path.\n' \
+      "$APP_NAME" "$START_CC_5H_WINDOW_CLAUDE_BIN" >&2
+  fi
+  printf 'WAKE_TIME=%s\n' "$(wake_time)"
+  printf 'CONFIG_DIR=%s\n' "$(config_dir)"
+  printf 'CONFIG_FILE=%s\n' "$(config_file)"
+  printf 'LOG_DIR=%s\n' "$(log_dir)"
+  printf 'LAUNCH_AGENT_FILE=%s\n' "$(launch_agent_file)"
+  printf 'LAUNCH_AGENT_LOADED=%s\n' "$(launch_agent_state)"
+  print_pmset_summary
+  print_latest_log
+}
+
+print_uninstall_plan() {
+  schedule_config_valid=$1
+  uid=$(id -u)
+  plist=$(launch_agent_file)
+  printf 'launchctl bootout gui/%s %s\n' "$uid" "$plist"
+  printf 'rm %s\n' "$plist"
+  if [ "$schedule_config_valid" != true ]; then
+    printf 'pmset repeat unchanged\n'
+    return 0
+  fi
+  schedule=$(pmset_schedule 2>/dev/null) || schedule=
+  if [ -n "$schedule" ] && has_repeat_wake_schedule "$schedule"; then
+    if matching_pmset_schedule "$schedule"; then
+      printf 'pmset repeat cancel\n'
+    else
+      printf 'pmset repeat unchanged\n'
+    fi
+  fi
+}
+
+uninstall() {
+  dry_run=false
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --dry-run) dry_run=true ;;
+      *) printf '%s: unknown uninstall flag: %s\n' "$APP_NAME" "$1" >&2; return 2 ;;
+    esac
+    shift
+  done
+
+  schedule_config_valid=true
+  if ! load_config; then
+    schedule_config_valid=false
+    set_defaults
+  elif ! validate_schedule_config; then
+    schedule_config_valid=false
+  fi
+
+  if [ "$dry_run" = true ]; then
+    print_uninstall_plan "$schedule_config_valid"
+    return 0
+  fi
+
+  uid=$(id -u)
+  plist=$(launch_agent_file)
+  launchctl bootout "gui/$uid" "$plist" >/dev/null 2>&1 || :
+  rm -f "$plist"
+  if [ "$schedule_config_valid" = true ]; then
+    clear_pmset_schedule_if_matching
+  else
+    printf '%s: invalid schedule config; leaving pmset unchanged\n' "$APP_NAME" >&2
+  fi
+}
+
+main() {
+  command=${1:-help}
+  case "$command" in
+    help|-h|--help) usage ;;
+    install) shift; install "$@" ;;
+    status) status ;;
+    run) run ;;
+    configure) configure ;;
+    uninstall) shift; uninstall "$@" ;;
+    *) printf '%s: unknown command: %s\n' "$APP_NAME" "$command" >&2; usage >&2; exit 2 ;;
+  esac
+}
+
+main "$@"

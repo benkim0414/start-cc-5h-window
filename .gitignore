@@ -5,7 +5,6 @@
 *.log
 
 # Build outputs
-bin/
 dist/
 .worktrees/
 
