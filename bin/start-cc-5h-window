@@ -524,11 +524,6 @@ run() {
   return "$exit_code"
 }
 
-not_implemented() {
-  printf '%s: %s is not implemented yet\n' "$APP_NAME" "$1" >&2
-  return 2
-}
-
 apply_config_env_overrides() {
   [ "$CONFIG_ENV_TIME_SET" = true ] && START_CC_5H_WINDOW_TIME=$CONFIG_ENV_TIME
   [ "$CONFIG_ENV_TIMEZONE_SET" = true ] && START_CC_5H_WINDOW_TIMEZONE=$CONFIG_ENV_TIMEZONE
