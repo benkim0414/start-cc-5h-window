@@ -617,6 +617,7 @@ status() {
     printf '%s: claude binary %s is not resolvable on PATH; the scheduled job will fail. Set START_CC_5H_WINDOW_CLAUDE_BIN to an absolute path.\n' \
       "$APP_NAME" "$START_CC_5H_WINDOW_CLAUDE_BIN" >&2
   fi
+  printf 'WAKE_TIME=%s\n' "$(wake_time)"
   printf 'CONFIG_DIR=%s\n' "$(config_dir)"
   printf 'CONFIG_FILE=%s\n' "$(config_file)"
   printf 'LOG_DIR=%s\n' "$(log_dir)"

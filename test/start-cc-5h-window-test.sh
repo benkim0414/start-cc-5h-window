@@ -53,6 +53,7 @@ assert_contains "$output" "START_CC_5H_WINDOW_TIME=07:00" "status shows default 
 assert_contains "$output" "START_CC_5H_WINDOW_TIMEZONE=Australia/Melbourne" "status shows default timezone"
 assert_contains "$output" "START_CC_5H_WINDOW_PROMPT=Reply with: ok" "status shows default prompt"
 assert_contains "$output" "START_CC_5H_WINDOW_CLAUDE_BIN=claude" "status shows default claude bin"
+assert_contains "$output" "WAKE_TIME=06:55" "status shows computed wake time"
 assert_contains "$output" "CONFIG_DIR=$HOME/.config/start-cc-5h-window" "status shows config dir"
 assert_contains "$output" "CONFIG_FILE=$HOME/.config/start-cc-5h-window/config.env" "status shows config file"
 assert_contains "$output" "LOG_DIR=$HOME/Library/Logs/start-cc-5h-window" "status shows log dir"
