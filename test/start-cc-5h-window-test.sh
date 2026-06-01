@@ -151,6 +151,10 @@ assert_contains "$output" "<key>Hour</key>" "dry-run prints plist hour key"
 assert_contains "$output" "<integer>7</integer>" "dry-run prints default hour"
 assert_contains "$output" "<key>Minute</key>" "dry-run prints plist minute key"
 assert_contains "$output" "<integer>0</integer>" "dry-run prints default minute"
+assert_contains "$output" "<key>EnvironmentVariables</key>" "dry-run plist sets EnvironmentVariables"
+assert_contains "$output" "<key>PATH</key>" "dry-run plist sets PATH"
+assert_contains "$output" "/.local/bin" "dry-run plist PATH includes user bin dir"
+assert_contains "$output" "PATH_ENV=" "dry-run plan prints PATH_ENV"
 assert_not_exists "$HOME/.config/start-cc-5h-window" "dry-run did not create config dir"
 assert_not_exists "$HOME/Library/LaunchAgents/com.local.start-cc-5h-window.plist" "dry-run did not create launch agent file"
 assert_not_exists "$HOME/Library/Logs/start-cc-5h-window" "dry-run did not create log dir"
@@ -283,6 +287,21 @@ output=$("$APP" install --overwrite-pmset 2>&1)
 assert_contains "$(cat "$PMSET_CALLS")" "repeat wakeorpoweron MTWRFSU 06:55:00" "overwrite install updates pmset repeat"
 
 assert_fails_contains "unknown install flag fails" "unknown install flag: --bogus" "$APP" install --bogus
+
+resolve_home="$tmpdir/resolve-home"
+HOME="$resolve_home"
+mkdir -p "$HOME"
+export HOME
+resolve_bin_dir="$tmpdir/claude-bin-dir"
+mkdir -p "$resolve_bin_dir"
+printf '#!/bin/sh\n' >"$resolve_bin_dir/claude"
+chmod +x "$resolve_bin_dir/claude"
+START_CC_5H_WINDOW_CLAUDE_BIN="$resolve_bin_dir/claude"
+export START_CC_5H_WINDOW_CLAUDE_BIN
+output=$("$APP" install --dry-run)
+assert_contains "$output" "PATH_ENV=$resolve_bin_dir:" "dry-run plan PATH leads with resolved claude bin dir"
+assert_contains "$output" "<string>$resolve_bin_dir:" "dry-run plist PATH leads with resolved claude bin dir"
+unset START_CC_5H_WINDOW_CLAUDE_BIN
 
 PATH="$ROOT_DIR/bin:$PATH"
 export PATH
@@ -439,6 +458,21 @@ assert_contains "$output" "LOG_DIR=$HOME/Library/Logs/start-cc-5h-window" "statu
 assert_contains "$output" "LAUNCH_AGENT_LOADED=loaded" "status shows loaded launch agent"
 assert_contains "$output" "PMSET_SCHEDULE=wakeorpoweron MTWRFSU 06:55:00" "status summarizes pmset schedule"
 assert_contains "$output" "LATEST_LOG=$HOME/Library/Logs/start-cc-5h-window/run-20260101080000-2.log" "status shows newest run log"
+assert_contains "$output" "CLAUDE_BIN_RESOLVED=$stubs/claude" "status resolves claude bin on PATH"
+
+unresolved_status_home="$tmpdir/unresolved-status-home"
+HOME="$unresolved_status_home"
+mkdir -p "$HOME/.config/start-cc-5h-window"
+export HOME
+cat >"$HOME/.config/start-cc-5h-window/config.env" <<'CONFIG'
+START_CC_5H_WINDOW_CLAUDE_BIN=/nonexistent/claude
+CONFIG
+output=$("$APP" status 2>/dev/null)
+assert_contains "$output" "CLAUDE_BIN_RESOLVED=unresolved" "status flags unresolvable claude bin"
+status_warning=$("$APP" status 2>&1 >/dev/null)
+assert_contains "$status_warning" "is not resolvable on PATH" "status emits unresolvable warning to stderr"
+HOME="$status_home"
+export HOME
 assert_contains "$(cat "$LAUNCHCTL_CALLS")" "print gui/501/com.local.start-cc-5h-window" "status checks launch agent state"
 assert_contains "$(cat "$PMSET_CALLS")" "-g sched" "status checks pmset schedule"
 

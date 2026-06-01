@@ -155,6 +155,41 @@ xml_sed_replacement() {
   sed_replacement "$(xml_escape "$1")"
 }
 
+resolve_claude_bin() {
+  bin=$START_CC_5H_WINDOW_CLAUDE_BIN
+  case "$bin" in
+    /*)
+      [ -x "$bin" ] || return 1
+      printf '%s\n' "$bin"
+      ;;
+    */*)
+      dir=$(CDPATH= cd "$(dirname "$bin")" 2>/dev/null && pwd) || return 1
+      resolved=$dir/$(basename "$bin")
+      [ -x "$resolved" ] || return 1
+      printf '%s\n' "$resolved"
+      ;;
+    *) command -v "$bin" 2>/dev/null || return 1 ;;
+  esac
+}
+
+# PATH written into the launchd plist. launchd starts LaunchAgents with a
+# minimal PATH (/usr/bin:/bin:/usr/sbin:/sbin), so a bare "claude" — or claude's
+# own node runtime — would not be found and the scheduled job would fail with
+# exit 127. We prepend the resolved claude directory (when resolvable) and the
+# common user/Homebrew install locations so the job finds the binary unattended.
+launchd_path_env() {
+  base="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+  if resolved=$(resolve_claude_bin); then
+    dir=$(dirname "$resolved")
+    case ":$base:" in
+      *":$dir:"*) printf '%s\n' "$base" ;;
+      *) printf '%s:%s\n' "$dir" "$base" ;;
+    esac
+  else
+    printf '%s\n' "$base"
+  fi
+}
+
 render_plist() {
   template=$(template_file)
   [ -f "$template" ] || {
@@ -167,6 +202,7 @@ render_plist() {
   minute=$(time_minute)
   out_log=$(xml_sed_replacement "$(stdout_log)")
   err_log=$(xml_sed_replacement "$(stderr_log)")
+  path_env=$(xml_sed_replacement "$(launchd_path_env)")
 
   sed \
     -e "s|__APP_PATH__|$app_path|g" \
@@ -174,6 +210,7 @@ render_plist() {
     -e "s|__MINUTE__|$minute|g" \
     -e "s|__STDOUT_LOG__|$out_log|g" \
     -e "s|__STDERR_LOG__|$err_log|g" \
+    -e "s|__PATH__|$path_env|g" \
     "$template"
 }
 
@@ -351,6 +388,7 @@ print_install_plan() {
   printf 'STDOUT_LOG=%s\n' "$(stdout_log)"
   printf 'STDERR_LOG=%s\n' "$(stderr_log)"
   printf 'APP_PATH=%s\n' "$(script_path)"
+  printf 'PATH_ENV=%s\n' "$(launchd_path_env)"
   printf 'launchctl bootstrap gui/%s %s\n' "$uid" "$(launch_agent_file)"
   printf 'pmset repeat wakeorpoweron MTWRFSU %s:00\n' "$wake"
 }
@@ -571,6 +609,13 @@ status() {
   printf 'START_CC_5H_WINDOW_TIMEZONE=%s\n' "$START_CC_5H_WINDOW_TIMEZONE"
   printf 'START_CC_5H_WINDOW_PROMPT=%s\n' "$START_CC_5H_WINDOW_PROMPT"
   printf 'START_CC_5H_WINDOW_CLAUDE_BIN=%s\n' "$START_CC_5H_WINDOW_CLAUDE_BIN"
+  if resolved=$(resolve_claude_bin); then
+    printf 'CLAUDE_BIN_RESOLVED=%s\n' "$resolved"
+  else
+    printf 'CLAUDE_BIN_RESOLVED=unresolved\n'
+    printf '%s: claude binary %s is not resolvable on PATH; the scheduled job will fail. Set START_CC_5H_WINDOW_CLAUDE_BIN to an absolute path.\n' \
+      "$APP_NAME" "$START_CC_5H_WINDOW_CLAUDE_BIN" >&2
+  fi
   printf 'CONFIG_DIR=%s\n' "$(config_dir)"
   printf 'CONFIG_FILE=%s\n' "$(config_file)"
   printf 'LOG_DIR=%s\n' "$(log_dir)"
